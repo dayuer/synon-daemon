@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -52,38 +52,44 @@ impl ClawProxy {
 
     /// 订阅 OpenClaw WS 实时事件（health/tick），持续运行，断线重连
     ///
-    /// 事件通过 `event_tx` 发给调用方（通常是 console_ws.rs 转发给 Console）
+    /// OpenClaw WS 不支持 auth 消息帧，token 通过 URL query param 传递。
+    /// 连接失败（OpenClaw 未启动）静默等 30s；连接成功后断开则指数退避（3→6…最大 60s）。
     pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>) {
-        let ws_url = format!("ws://127.0.0.1:{}/ws", self.port);
-        let token = self.token.clone();
+        // token 通过 query param 传递，兼容 OpenClaw ws 鉴权约定
+        let ws_url = if self.token.is_empty() {
+            format!("ws://127.0.0.1:{}/ws", self.port)
+        } else {
+            format!("ws://127.0.0.1:{}/ws?token={}", self.port, self.token)
+        };
+
+        let mut retry_secs: u64 = 3;
 
         loop {
             match connect_async(&ws_url).await {
                 Err(e) => {
+                    // OpenClaw 未启动，静默等待 30s，重置退避
                     debug!("[ClawEvent] OpenClaw WS 连接失败 ({e})，30s 后重试");
                     sleep(Duration::from_secs(30)).await;
+                    retry_secs = 3;
                 }
                 Ok((ws_stream, _)) => {
                     info!("[ClawEvent] 已连接 OpenClaw WS");
                     let (mut write, mut read) = ws_stream.split();
-
-                    // 发送认证帧
-                    let auth = json!({ "type": "auth", "token": token });
-                    if write.send(Message::Text(auth.to_string())).await.is_err() {
-                        warn!("[ClawEvent] 发送 auth 帧失败");
-                        sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
 
                     // 接收事件循环
                     while let Some(msg) = read.next().await {
                         let text = match msg {
                             Ok(Message::Text(t)) => t.to_string(),
                             Ok(Message::Close(_)) => {
-                                warn!("[ClawEvent] OpenClaw WS 关闭，重连...");
+                                debug!("[ClawEvent] OpenClaw WS 正常关闭");
                                 break;
                             }
-                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                            Ok(Message::Ping(data)) => {
+                                // 回 Pong 保活
+                                let _ = write.send(Message::Pong(data)).await;
+                                continue;
+                            }
+                            Ok(Message::Pong(_)) => continue,
                             Err(e) => {
                                 warn!("[ClawEvent] WS 错误: {e}");
                                 break;
@@ -101,14 +107,17 @@ impl ClawProxy {
                         if matches!(event_type.as_str(), "health" | "tick" | "error" | "heartbeat") {
                             let evt = ClawEvent { event_type, data: val };
                             if event_tx.send(evt).await.is_err() {
-                                // 调用方已关闭，退出
-                                return;
+                                return; // 调用方已关闭，退出
                             }
                         }
                     }
+
+                    // 连接断开：指数退避（最大 60s）
+                    info!("[ClawEvent] OpenClaw WS 断开，{retry_secs}s 后重连");
+                    sleep(Duration::from_secs(retry_secs)).await;
+                    retry_secs = (retry_secs * 2).min(60);
                 }
             }
-            sleep(Duration::from_secs(30)).await;
         }
     }
 
