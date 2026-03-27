@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tracing::{debug, info, warn};
 
 pub struct ClawProxy {
@@ -85,7 +86,7 @@ impl ClawProxy {
                 }
             };
             ws_req.headers_mut().insert(
-                "Authorization",
+                AUTHORIZATION,
                 format!("Bearer {token}").parse().expect("header value parse"),
             );
             match connect_async(ws_req).await {
@@ -97,54 +98,34 @@ impl ClawProxy {
                 Ok((ws_stream, _)) => {
                     info!("[ClawEvent] 已连接 OpenClaw WS");
                     let (mut write, mut read) = ws_stream.split();
-                    // 每 5s 主动 Ping，防止 OpenClaw 10s idle timeout 踢连
-                    let mut ping_ticker = interval(Duration::from_secs(5));
-                    ping_ticker.tick().await; // 跳过立即触发的第一次
 
-                    'conn: loop {
-                        tokio::select! {
-                            // 定时发 Ping 保活
-                            _ = ping_ticker.tick() => {
-                                if write.send(Message::Ping(vec![])).await.is_err() {
-                                    debug!("[ClawEvent] Ping 发送失败，认为连接已断");
-                                    break 'conn;
-                                }
+                    while let Some(msg) = read.next().await {
+                        let text = match msg {
+                            Ok(Message::Text(t)) => t.to_string(),
+                            Ok(Message::Close(_)) => {
+                                debug!("[ClawEvent] OpenClaw WS 正常关闭");
+                                break;
                             }
+                            Ok(Message::Ping(data)) => {
+                                let _ = write.send(Message::Pong(data)).await;
+                                continue;
+                            }
+                            Ok(Message::Pong(_)) => continue,
+                            Err(e) => {
+                                warn!("[ClawEvent] WS 错误: {e}");
+                                break;
+                            }
+                            _ => continue,
+                        };
 
-                            // 接收服务端消息
-                            msg = read.next() => {
-                                let msg = match msg {
-                                    Some(m) => m,
-                                    None => break 'conn,
-                                };
-                                let text = match msg {
-                                    Ok(Message::Text(t)) => t.to_string(),
-                                    Ok(Message::Close(_)) => {
-                                        debug!("[ClawEvent] OpenClaw WS 正常关闭");
-                                        break 'conn;
-                                    }
-                                    Ok(Message::Ping(data)) => {
-                                        let _ = write.send(Message::Pong(data)).await;
-                                        continue 'conn;
-                                    }
-                                    Ok(Message::Pong(_)) => continue 'conn,
-                                    Err(e) => {
-                                        warn!("[ClawEvent] WS 错误: {e}");
-                                        break 'conn;
-                                    }
-                                    _ => continue 'conn,
-                                };
-
-                                let Ok(val): Result<Value, _> = serde_json::from_str(&text) else {
-                                    continue 'conn;
-                                };
-                                let event_type = val["type"].as_str().unwrap_or("").to_string();
-                                if matches!(event_type.as_str(), "health" | "tick" | "error" | "heartbeat") {
-                                    let evt = ClawEvent { event_type, data: val };
-                                    if event_tx.send(evt).await.is_err() {
-                                        return; // 调用方已关闭
-                                    }
-                                }
+                        let Ok(val): Result<Value, _> = serde_json::from_str(&text) else {
+                            continue;
+                        };
+                        let event_type = val["type"].as_str().unwrap_or("").to_string();
+                        if matches!(event_type.as_str(), "health" | "tick" | "error" | "heartbeat") {
+                            let evt = ClawEvent { event_type, data: val };
+                            if event_tx.send(evt).await.is_err() {
+                                return; // 调用方已关闭
                             }
                         }
                     }
