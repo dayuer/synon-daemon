@@ -259,39 +259,67 @@ fn read_gnb_status(map_path: &str) -> (String, String) {
     (status, addrs)
 }
 
-/// OpenClaw 进程 CPU 占用（读 /proc/{pid}/stat，双采 500ms 间隔）
-/// 通过 pgrep 找到 openclaw 主进程 PID，然后读 /proc/{pid}/stat 的 utime+stime
+/// OpenClaw 进程组 CPU 占用（读 /proc/{pid}/stat，双采 500ms 间隔）
+///
+/// OpenClaw 由两个进程组成：
+///   - `openclaw`         — 主进程（守护 + 调度，CPU 极低）
+///   - `openclaw-gateway` — 核心 gateway（WS + AI，消耗主要 CPU）
+///
+/// 用 `pgrep -a openclaw` 匹配所有前缀为 openclaw 的进程，CPU 求和。
 async fn read_claw_cpu() -> f64 {
-    // 找 PID
-    let pid = Command::new("pgrep")
-        .args(["-x", "openclaw"])
+    // pgrep -a openclaw：匹配进程名前缀，返回 "pid cmdline" 多行
+    let pids: Vec<u32> = Command::new("pgrep")
+        .args(["-a", "openclaw"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.lines().next().map(str::trim).and_then(|l| l.parse::<u32>().ok()));
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let Some(pid) = pid else { return 0.0; };
+    if pids.is_empty() { return 0.0; }
 
-    let read_proc_stat = |pid: u32| -> Option<(u64, u64)> {
+    // 读 /proc/{pid}/stat 的 utime+stime（jiffies），同时读系统总 uptime tick
+    let read_proc_stat = |pid: u32| -> Option<u64> {
         let content = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let parts: Vec<&str> = content.split_whitespace().collect();
-        // /proc/pid/stat: utime=field[13], stime=field[14]（0-indexed）
+        // field[13]=utime, field[14]=stime（0-indexed）
         let utime: u64 = parts.get(13)?.parse().ok()?;
         let stime: u64 = parts.get(14)?.parse().ok()?;
-        // /proc/uptime: 系统总 tick 数（hertz=100 on Linux）
-        let uptime_str = std::fs::read_to_string("/proc/uptime").ok()?;
-        let uptime_ticks = (uptime_str.split_whitespace().next()?.parse::<f64>().ok()? * 100.0) as u64;
-        Some((utime + stime, uptime_ticks))
+        Some(utime + stime)
     };
 
-    let s1 = read_proc_stat(pid).unwrap_or((0, 0));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let s2 = read_proc_stat(pid).unwrap_or((0, 0));
+    let read_uptime_ticks = || -> u64 {
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+            .map(|f| (f * 100.0) as u64)
+            .unwrap_or(0)
+    };
 
-    let proc_diff = s2.0.saturating_sub(s1.0) as f64;
-    let total_diff = s2.1.saturating_sub(s1.1) as f64;
+    // 第一次采样：所有 openclaw* 进程 jiffies 之和
+    let proc_jiffies_1: u64 = pids.iter().filter_map(|&p| read_proc_stat(p)).sum();
+    let uptime_1 = read_uptime_ticks();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 第二次采样
+    let proc_jiffies_2: u64 = pids.iter().filter_map(|&p| read_proc_stat(p)).sum();
+    let uptime_2 = read_uptime_ticks();
+
+    let proc_diff  = proc_jiffies_2.saturating_sub(proc_jiffies_1) as f64;
+    let total_diff = uptime_2.saturating_sub(uptime_1) as f64;
     if total_diff == 0.0 { return 0.0; }
-    (proc_diff / total_diff * 100.0 * 10.0).round() / 10.0
+
+    // 乘以核数得到相对于单核的百分比（多核进程可突破 100%）
+    let cores = read_cpu_cores() as f64;
+    let raw = proc_diff / total_diff * 100.0;
+    // 归一化到 0-100（占总 CPU 资源百分比）
+    let normalized = if cores > 0.0 { raw / cores * 100.0 } else { raw };
+    (normalized * 10.0).round() / 10.0
 }
 
 /// OpenClaw RPC 可用性（GET http://127.0.0.1:{port}/api/status）
