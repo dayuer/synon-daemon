@@ -82,6 +82,24 @@ async fn main() {
         config.claw_port,
     );
 
+    // 启动时立即刷新 skills 缓存（确保心跳上报第一帧就有 skills 数据）
+    tokio::spawn(async {
+        match skills_manager::refresh_cache().await {
+            Ok(v)  => tracing::info!("[Skills] 启动时刷新完成，共 {} 个技能", v.len()),
+            Err(e) => tracing::warn!("[Skills] 启动时刷新失败: {e}"),
+        }
+    });
+
+    // 每 5 分钟定时刷新 skills 缓存（openclaw 技能状态可能随时变化）
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
+        interval.tick().await; // 跳过第一次（启动时已刷新）
+        loop {
+            interval.tick().await;
+            let _ = skills_manager::refresh_cache().await;
+        }
+    });
+
     // 启动 Console WSS 连接（含自动重连）
     console_ws::run(config, alert_rx).await;
 }
