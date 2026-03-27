@@ -77,7 +77,8 @@ pub async fn refresh_cache() -> Result<Vec<SkillInfo>> {
     .context("技能列表查询超时")?
     .context("openclaw skills list 执行失败")?;
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    // openclaw skills list --json 将 JSON 输出到 stderr（非 stdout），需读 stderr
+    let text = String::from_utf8_lossy(&output.stderr);
 
     // openclaw 输出是 {workspaceDir, managedSkillsDir, skills: [...]}，非裸数组
     let skills: Vec<SkillInfo> = if let Ok(resp) = serde_json::from_str::<SkillsListResponse>(&text) {
