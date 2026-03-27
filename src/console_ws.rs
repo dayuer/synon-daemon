@@ -10,7 +10,8 @@
 //!   server → client: { type: "claw_rpc", reqId, method, params }
 
 use crate::config::DaemonConfig;
-use crate::claw_proxy::ClawProxy;
+use crate::claw_proxy::{ClawProxy, ClawEvent};
+use crate::exec_handler;
 use crate::gnb_controller;
 use crate::heartbeat;
 use crate::gnb_monitor;
@@ -99,6 +100,13 @@ async fn connect_and_run(
     // 3. 重连成功，重置退避计数（通过返回正常退出触发）
     let config = config.clone();
     let (beat_tx, mut beat_rx) = mpsc::channel::<String>(8);
+    let (claw_evt_tx, mut claw_evt_rx) = mpsc::channel::<ClawEvent>(32);
+
+    // 订阅 OpenClaw 实时事件（health/tick）
+    let claw_for_events = claw_proxy.clone_for_events();
+    tokio::spawn(async move {
+        claw_for_events.subscribe_events(claw_evt_tx).await;
+    });
 
     // 心跳发送 Task
     let beat_config = config.clone();
@@ -122,6 +130,21 @@ async fn connect_and_run(
             Some(msg) = beat_rx.recv() => {
                 write.send(Message::Text(msg.into())).await?;
                 debug!("心跳已发送");
+            }
+
+            // 转发 claw_event 给 Console
+            Some(evt) = claw_evt_rx.recv() => {
+                let msg = json!({
+                    "type": "claw_event",
+                    "nodeId": config.node_id,
+                    "event": evt.event_type,
+                    "data": evt.data,
+                    "ts": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                });
+                write.send(Message::Text(msg.to_string().into())).await?;
             }
 
             // 发送 watchdog 告警
@@ -205,6 +228,41 @@ async fn handle_server_message(
             write.send(Message::Text(resp.to_string().into())).await?;
         }
 
+        // 受限命令执行（Phase 3）
+        "exec_cmd" => {
+            let command = msg["command"].as_str().unwrap_or("");
+            let allowed_extra: Vec<&str> = msg["allowedCmds"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+
+            let result = exec_handler::exec_allowed(command, &allowed_extra).await;
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": result.code == 0,
+                "code": result.code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            });
+            write.send(Message::Text(resp.to_string().into())).await?;
+        }
+
+        // 文件分发（Phase 3）
+        "deploy_file" => {
+            let path_str = msg["path"].as_str().unwrap_or("");
+            let content_b64 = msg["content_b64"].as_str().unwrap_or("");
+
+            let result = handle_deploy_file(path_str, content_b64);
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": result.is_ok(),
+                "stderr": result.err().map(|e| e.to_string()).unwrap_or_default(),
+            });
+            write.send(Message::Text(resp.to_string().into())).await?;
+        }
+
         unknown => debug!("收到未知消息类型: {unknown}"),
     }
     Ok(())
@@ -258,7 +316,83 @@ fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// 构建心跳 JSON
+/// 文件分发处理 — base64 解码后原子写入目标路径
+fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
+    use std::path::Path;
+
+    if path_str.is_empty() {
+        return Err(anyhow::anyhow!("path 为空"));
+    }
+
+    let path = Path::new(path_str);
+
+    // 安全校验：必须绝对路径 + 不含路径穿越
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!("path 必须是绝对路径: {path_str}"));
+    }
+    if path_str.contains("..") {
+        return Err(anyhow::anyhow!("path 不允许包含 '..': {path_str}"));
+    }
+
+    // base64 解码
+    let content = base64_decode(content_b64)?;
+
+    // 确保父目录存在
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {e}", parent.display()))?;
+    }
+
+    // 原子写入 tmp → rename
+    let tmp = path.with_extension("deploy_tmp");
+    std::fs::write(&tmp, &content)
+        .map_err(|e| anyhow::anyhow!("写临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow::anyhow!("rename 失败: {e}"))?;
+
+    info!("[DeployFile] 写入 {} ({} bytes)", path_str, content.len());
+    Ok(())
+}
+
+/// 简单 base64 解码（标准字母表，padding 可选）
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    // 使用 Rust 标准方式：通过 u8 查表
+    let input = input.trim();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in alphabet.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+
+    let input: Vec<u8> = input.bytes().filter(|&b| b != b'=').collect();
+    let mut i = 0;
+    while i < input.len() {
+        let rem = input.len() - i;
+        let a = table[input[i] as usize];
+        if a == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+
+        if rem >= 2 {
+            let b = table[input[i+1] as usize];
+            if b == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+            out.push((a << 2) | (b >> 4));
+            if rem >= 3 {
+                let c = table[input[i+2] as usize];
+                if c == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+                out.push((b << 4) | (c >> 2));
+                if rem >= 4 {
+                    let d = table[input[i+3] as usize];
+                    if d == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+                    out.push((c << 6) | d);
+                    i += 4;
+                } else { i += 3; }
+            } else { i += 2; }
+        } else { i += 1; }
+    }
+    Ok(out)
+}
+
+/// 构建心跳 JSON（对齐 node-agent.sh 全量字段，Console ingestFromDaemon 直接消费）
 async fn build_heartbeat(config: &DaemonConfig) -> Result<String> {
     let sys = heartbeat::collect().await?;
     let gnb = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy()).ok();
@@ -267,10 +401,14 @@ async fn build_heartbeat(config: &DaemonConfig) -> Result<String> {
         "type": "heartbeat",
         "nodeId": config.node_id,
         "ts": sys.ts,
-        "sysInfo": sys,
+        "sysInfo": sys,                            // 完整系统状态（CPU/内存/磁盘等）
+        "gnbStatus": sys.gnb_status,               // gnb_ctl -s 原始输出（与 agent.sh 兼容）
+        "gnbAddresses": sys.gnb_addresses,         // gnb_ctl -a 原始输出
         "gnbPeers": gnb.as_ref().map(|s| &s.peers),
         "gnbTunAddr": gnb.as_ref().map(|s| &s.tun_addr),
         "clawRunning": sys.claw_running,
+        "clawRpcOk": sys.claw_rpc_ok,
+        "installedSkills": sys.installed_skills,   // /opt/gnb/cache/skills.json
     });
     Ok(msg.to_string())
 }

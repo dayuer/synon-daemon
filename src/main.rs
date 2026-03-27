@@ -1,16 +1,18 @@
 //! main.rs — synon-daemon 入口
 //!
 //! 用法:
-//!   synon-daemon                           # 从默认路径 /opt/gnb/bin/agent.conf 加载
-//!   synon-daemon --env /path/to/agent.conf  # 指定配置文件
+//!   synon-daemon                              # 从默认路径 /opt/gnb/bin/agent.conf 加载
+//!   synon-daemon --config /path/to/agent.conf # 指定配置文件
 //!   synon-daemon --help
 
 mod config;
 mod console_ws;
 mod claw_proxy;
+mod exec_handler;
 mod gnb_controller;
 mod gnb_monitor;
 mod heartbeat;
+mod self_updater;
 mod watchdog;
 
 use clap::Parser;
@@ -21,7 +23,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 struct Args {
     /// agent.conf 路径（默认: /opt/gnb/bin/agent.conf）
     #[arg(long, default_value = "/opt/gnb/bin/agent.conf")]
-    env: String,
+    config: String,
 
     /// 日志级别 (error|warn|info|debug|trace)
     #[arg(long, default_value = "info")]
@@ -45,7 +47,7 @@ async fn main() {
     tracing::info!("synon-daemon v{} 启动", env!("CARGO_PKG_VERSION"));
 
     // 加载配置
-    let config = match config::DaemonConfig::load(Some(&args.env)) {
+    let config = match config::DaemonConfig::load(Some(&args.config)) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("配置加载失败: {e}");
@@ -65,6 +67,18 @@ async fn main() {
     tokio::spawn(async move {
         watchdog::run(node_id, alert_tx).await;
     });
+
+    // 启动自动更新检查（24h 间隔，首次延迟 5min）
+    let updater_config = config.clone();
+    tokio::spawn(async move {
+        self_updater::run(updater_config).await;
+    });
+
+    // 初始化 heartbeat 采集参数（gnb_map_path + claw_port）
+    heartbeat::init(
+        config.gnb_map_path.to_string_lossy().to_string(),
+        config.claw_port,
+    );
 
     // 启动 Console WSS 连接（含自动重连）
     console_ws::run(config, alert_rx).await;

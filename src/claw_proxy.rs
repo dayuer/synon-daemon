@@ -2,10 +2,17 @@
 //! 同机进程，直连 127.0.0.1:18789，零 SSH 依赖
 
 use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, info, warn};
 
 pub struct ClawProxy {
+    pub port: u16,
     base_url: String,
     token: String,
     client: reqwest::Client,
@@ -18,15 +25,90 @@ pub struct ClawStatus {
     pub uptime_ms: Option<u64>,
 }
 
+/// OpenClaw 实时事件（从其 WS 订阅）
+#[derive(Debug, Clone, Serialize)]
+pub struct ClawEvent {
+    pub event_type: String, // "health" | "tick" | "error"
+    pub data: Value,
+}
+
 impl ClawProxy {
     pub fn new(port: u16, token: &str) -> Self {
         ClawProxy {
+            port,
             base_url: format!("http://127.0.0.1:{port}"),
             token: token.to_string(),
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(Duration::from_secs(5))
                 .build()
                 .expect("构建 HTTP 客户端失败"),
+        }
+    }
+
+    /// 创建用于 subscribe_events() 的轻量克隆（仅含 port 和 token）
+    pub fn clone_for_events(&self) -> ClawProxy {
+        ClawProxy::new(self.port, &self.token)
+    }
+
+    /// 订阅 OpenClaw WS 实时事件（health/tick），持续运行，断线重连
+    ///
+    /// 事件通过 `event_tx` 发给调用方（通常是 console_ws.rs 转发给 Console）
+    pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>) {
+        let ws_url = format!("ws://127.0.0.1:{}/ws", self.port);
+        let token = self.token.clone();
+
+        loop {
+            match connect_async(&ws_url).await {
+                Err(e) => {
+                    debug!("[ClawEvent] OpenClaw WS 连接失败 ({e})，30s 后重试");
+                    sleep(Duration::from_secs(30)).await;
+                }
+                Ok((ws_stream, _)) => {
+                    info!("[ClawEvent] 已连接 OpenClaw WS");
+                    let (mut write, mut read) = ws_stream.split();
+
+                    // 发送认证帧
+                    let auth = json!({ "type": "auth", "token": token });
+                    if write.send(Message::Text(auth.to_string().into())).await.is_err() {
+                        warn!("[ClawEvent] 发送 auth 帧失败");
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+
+                    // 接收事件循环
+                    while let Some(msg) = read.next().await {
+                        let text = match msg {
+                            Ok(Message::Text(t)) => t.to_string(),
+                            Ok(Message::Close(_)) => {
+                                warn!("[ClawEvent] OpenClaw WS 关闭，重连...");
+                                break;
+                            }
+                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                            Err(e) => {
+                                warn!("[ClawEvent] WS 错误: {e}");
+                                break;
+                            }
+                            _ => continue,
+                        };
+
+                        let Ok(val): Result<Value, _> = serde_json::from_str(&text) else {
+                            continue;
+                        };
+
+                        let event_type = val["type"].as_str().unwrap_or("").to_string();
+
+                        // 转发 health/tick/error 事件给 Console
+                        if matches!(event_type.as_str(), "health" | "tick" | "error" | "heartbeat") {
+                            let evt = ClawEvent { event_type, data: val };
+                            if event_tx.send(evt).await.is_err() {
+                                // 调用方已关闭，退出
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_secs(30)).await;
         }
     }
 
@@ -51,7 +133,6 @@ impl ClawProxy {
         let running = match output {
             Ok(o) if o.status.success() => {
                 let text = String::from_utf8_lossy(&o.stdout);
-                // "Runtime: running" 或 JSON 中 running: true
                 text.contains("running")
             }
             _ => false,
@@ -66,11 +147,6 @@ impl ClawProxy {
 
     /// 通用 HTTP 调用（供 Console 的 claw_rpc 消息使用）
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
-        // method 格式：
-        //   "status"         → GET /status
-        //   "models"         → GET /v1/models
-        //   "config.get"     → 通过 CLI openclaw gateway status --json
-        //   "config.patch"   → 通过 CLI opencclaw config set
         match method {
             "status" => {
                 let status = self.get_status().await;
