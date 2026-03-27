@@ -522,37 +522,53 @@ async fn dispatch_slow(
 ///
 /// - Phase 1 (newPubkey only):    追加新公钥到 authorized_keys
 /// - Phase 2 (+ removeOldPubkey): 再删除旧公钥
+///
+/// 同时更新 synon（主用户）和 root（后备通道）两份 authorized_keys
 fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
-    let auth_keys_path = std::path::PathBuf::from("/root/.ssh/authorized_keys");
-    let tmp_path = auth_keys_path.with_extension("tmp");
-
     // 参数提取与格式校验（防注入）
     let new_key = msg["newPubkey"].as_str()
         .ok_or_else(|| anyhow::anyhow!("缺少 newPubkey"))?;
     if !new_key.trim_start().starts_with("ssh-") {
         return Err(anyhow::anyhow!("newPubkey 格式非法（必须以 ssh- 开头）"));
     }
+    let remove_old = msg["removeOldPubkey"].as_str();
 
-    let existing = std::fs::read_to_string(&auth_keys_path).unwrap_or_default();
+    // synon 用户（Console SSH 主连接用户）
+    let synon_path = std::path::PathBuf::from("/home/synon/.ssh/authorized_keys");
+    if synon_path.parent().map(|p| p.exists()).unwrap_or(false) {
+        update_authorized_keys(&synon_path, new_key, remove_old)?;
+        info!("密钥轮换: synon authorized_keys 已更新");
+    }
 
-    // 构建新的 authorized_keys 内容
+    // root 用户（紧急后备通道）
+    let root_path = std::path::PathBuf::from("/root/.ssh/authorized_keys");
+    update_authorized_keys(&root_path, new_key, remove_old)?;
+    info!("密钥轮换: root authorized_keys 已更新");
+
+    Ok(())
+}
+
+/// 原子更新单个 authorized_keys 文件（追加新公钥 + 可选删除旧公钥）
+fn update_authorized_keys(
+    auth_keys_path: &std::path::PathBuf,
+    new_key: &str,
+    remove_old: Option<&str>,
+) -> Result<()> {
+    let tmp_path = auth_keys_path.with_extension("tmp");
+    let existing = std::fs::read_to_string(auth_keys_path).unwrap_or_default();
+
     let mut lines: Vec<&str> = existing.lines().collect();
 
     // 追加新公钥（幂等）
     let new_key_trimmed = new_key.trim();
     if !lines.iter().any(|l| l.trim() == new_key_trimmed) {
         lines.push(new_key_trimmed);
-        info!("密钥轮换 Phase1: 已追加新公钥");
     }
 
     // Phase 2: 删除旧公钥
-    if let Some(old_key) = msg["removeOldPubkey"].as_str() {
+    if let Some(old_key) = remove_old {
         let old_trimmed = old_key.trim();
-        let before = lines.len();
         lines.retain(|l| l.trim() != old_trimmed);
-        if lines.len() < before {
-            info!("密钥轮换 Phase2: 已删除旧公钥");
-        }
     }
 
     let content = format!("{}\n", lines.join("\n"));
@@ -560,7 +576,7 @@ fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
     // 原子写入 tmp → rename
     std::fs::write(&tmp_path, &content)
         .map_err(|e| anyhow::anyhow!("写 authorized_keys.tmp 失败: {e}"))?;
-    std::fs::rename(&tmp_path, &auth_keys_path)
+    std::fs::rename(&tmp_path, auth_keys_path)
         .map_err(|e| anyhow::anyhow!("rename authorized_keys 失败: {e}"))?;
 
     Ok(())
