@@ -16,16 +16,29 @@ use tracing::{debug, info};
 
 const SKILLS_CACHE: &str = "/opt/gnb/cache/skills.json";
 
-/// 单条技能信息
+/// 单条技能信息（对齐 openclaw skills list --json 输出格式）
+/// 真实格式：{workspaceDir, managedSkillsDir, skills: [...]}
+/// 每条 skill: {name, description, emoji, eligible, disabled, bundled, source, ...}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillInfo {
-    pub id: String,
+    /// 技能名称（openclaw 用 name 作为唯一 ID，无单独 id 字段）
     pub name: String,
-    pub version: String,
     #[serde(default)]
-    pub enabled: bool,
+    pub description: String,
+    #[serde(default)]
+    pub emoji: String,
+    /// 是否满足依赖（bins/env/config 全部就绪）
+    #[serde(default)]
+    pub eligible: bool,
+    #[serde(default)]
+    pub disabled: bool,
+    /// 是否内置技能（openclaw-bundled）
+    #[serde(default)]
+    pub bundled: bool,
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub homepage: String,
 }
 
 /// 从本地 skills.json 缓存读取已安装技能列表（秒级，无 IO 等待）
@@ -44,6 +57,14 @@ pub fn list_from_cache() -> Vec<SkillInfo> {
     }
 }
 
+/// openclaw skills list --json 的外层响应结构
+#[derive(Debug, Deserialize)]
+struct SkillsListResponse {
+    #[serde(default)]
+    skills: Vec<SkillInfo>,
+    // workspaceDir / managedSkillsDir 忽略
+}
+
 /// 通过 openclaw CLI 查询已安装技能（实时），并刷新缓存
 pub async fn refresh_cache() -> Result<Vec<SkillInfo>> {
     let output = tokio::time::timeout(
@@ -57,8 +78,14 @@ pub async fn refresh_cache() -> Result<Vec<SkillInfo>> {
     .context("openclaw skills list 执行失败")?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let skills: Vec<SkillInfo> = serde_json::from_str(&text)
-        .unwrap_or_default();
+
+    // openclaw 输出是 {workspaceDir, managedSkillsDir, skills: [...]}，非裸数组
+    let skills: Vec<SkillInfo> = if let Ok(resp) = serde_json::from_str::<SkillsListResponse>(&text) {
+        resp.skills
+    } else {
+        // 兼容旧版可能的裸数组格式
+        serde_json::from_str::<Vec<SkillInfo>>(&text).unwrap_or_default()
+    };
 
     // 写入缓存（下次心跳直接读）
     if let Ok(json) = serde_json::to_string_pretty(&skills) {
