@@ -30,12 +30,13 @@ struct VersionMeta {
     url: String,
 }
 
-/// 架构标识（编译时决定）
+/// 架构标识（编译时决定，与 initnode.sh 的 mirror 文件命名保持一致）
 fn arch_tag() -> &'static str {
     if cfg!(target_arch = "x86_64") { "x86_64-musl" }
     else if cfg!(target_arch = "aarch64") { "aarch64-musl" }
     else if cfg!(target_arch = "arm") { "armv7-musl" }
-    else { "x86_64-musl" }
+    else if cfg!(target_arch = "mips") || cfg!(target_arch = "mips64") { "mips-musl" }
+    else { "x86_64-musl" } // 未知架构回退，Console 端需有对应包
 }
 
 /// 运行自动更新循环（阻塞，应在独立 tokio task 中运行）
