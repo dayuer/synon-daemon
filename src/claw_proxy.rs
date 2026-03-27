@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -61,7 +62,7 @@ impl ClawProxy {
     /// - token 未就绪（OpenClaw 未安装）：静默等 30s 后重试
     /// - 连接成功后每 5s 主动 Ping 保活，防止服务端 idle timeout
     /// - 断开后指数退避（3→6→12…最大 60s）
-    pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>) {
+    pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>, cancel: CancellationToken) {
         let ws_base = format!("ws://127.0.0.1:{}/ws", self.port);
         let mut retry_secs: u64 = 3;
 
@@ -70,7 +71,10 @@ impl ClawProxy {
             let token = Self::read_claw_token_from_config();
             if token.is_none() {
                 debug!("[ClawEvent] openclaw.json 不存在或 token 未配置，30s 后重试");
-                sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(30)) => {}
+                    _ = cancel.cancelled() => { return; }
+                }
                 retry_secs = 3;
                 continue;
             }
@@ -81,7 +85,10 @@ impl ClawProxy {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("[ClawEvent] WS URL 解析失败: {e}");
-                    sleep(Duration::from_secs(30)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(30)) => {}
+                        _ = cancel.cancelled() => { return; }
+                    }
                     continue;
                 }
             };
@@ -92,7 +99,10 @@ impl ClawProxy {
             match connect_async(ws_req).await {
                 Err(e) => {
                     debug!("[ClawEvent] OpenClaw WS 连接失败 ({e})，30s 后重试");
-                    sleep(Duration::from_secs(30)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(30)) => {}
+                        _ = cancel.cancelled() => { return; }
+                    }
                     retry_secs = 3;
                 }
                 Ok((ws_stream, _)) => {
@@ -131,7 +141,10 @@ impl ClawProxy {
                     }
                     debug!("[ClawEvent] connect 消息已发送，等待 hello-ok");
 
-                    while let Some(msg) = read.next().await {
+                    while let Some(msg) = tokio::select! {
+                        msg = read.next() => msg,
+                        _ = cancel.cancelled() => None,
+                    } {
                         let text = match msg {
                             Ok(Message::Text(t)) => t.to_string(),
                             Ok(Message::Close(_)) => {
@@ -162,9 +175,15 @@ impl ClawProxy {
                         }
                     }
 
+                    // 如果是 cancel 触发的退出，直接返回
+                    if cancel.is_cancelled() { return; }
+
                     // 连接断开：指数退避（最大 60s）
                     info!("[ClawEvent] OpenClaw WS 断开，{retry_secs}s 后重连");
-                    sleep(Duration::from_secs(retry_secs)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(retry_secs)) => {}
+                        _ = cancel.cancelled() => { return; }
+                    }
                     retry_secs = (retry_secs * 2).min(60);
                 }
             }

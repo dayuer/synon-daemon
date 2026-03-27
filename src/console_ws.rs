@@ -180,11 +180,15 @@ async fn connect_and_run(
         task_executor::run(task_rx, exec_resp_tx, exec_in_flight).await;
     });
 
-    // 订阅 OpenClaw 实时事件（health/tick）
+    // 订阅 OpenClaw 实时事件（per-connection token，退出时自动取消旧订阅，防连接泄漏）
+    let claw_cancel = tokio_util::sync::CancellationToken::new();
     let claw_for_events = claw_proxy.clone_for_events();
+    let claw_cancel_child = claw_cancel.clone();
     tokio::spawn(async move {
-        claw_for_events.subscribe_events(claw_evt_tx).await;
+        claw_for_events.subscribe_events(claw_evt_tx, claw_cancel_child).await;
     });
+    // drop guard：connect_and_run 退出时（正常/错误/panic）自动 cancel
+    let _claw_guard = claw_cancel.drop_guard();
 
     // 心跳发送 Task（含 systemd watchdog 通知）
     let beat_config = config.clone();
