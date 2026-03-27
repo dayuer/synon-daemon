@@ -23,11 +23,14 @@ use crate::watchdog::WatchdogAlert;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use socket2::{Socket, TcpKeepalive, Domain, Type, Protocol};
 use std::time::Duration;
+use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{tungstenite::Message};
 use tracing::{debug, info, warn};
+use url::Url;
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
@@ -57,12 +60,51 @@ pub async fn run(
     }
 }
 
-/// 单次连接的完整生命周期
+/// 单次连接的完整生命周期（带 TCP keepalive 防 NAT 超时）
 async fn connect_and_run(
     config: &DaemonConfig,
     alert_rx: &mut mpsc::Receiver<WatchdogAlert>,
 ) -> Result<()> {
-    let (ws_stream, _) = connect_async(&config.console_url).await
+    // ── 1. 解析 URL → 建立带 SO_KEEPALIVE 的 TCP 连接 ──────────────────────
+    let url = Url::parse(&config.console_url)
+        .map_err(|e| anyhow::anyhow!("URL 解析失败: {e}"))?;
+    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("URL 缺少 host"))?;
+    let port = url.port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("URL 缺少端口"))?;
+    // DNS 解析
+    let addr = tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("DNS 解析失败: {e}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("DNS 解析返回空"))?;
+
+    // 用 socket2 创建 TCP socket，设置 keepalive 参数后再连接
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| anyhow::anyhow!("socket 创建失败: {e}"))?;
+    // TCP keepalive: 30s 空闲后开始探测，每 10s 一次，最多 3 次未回应则断开
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    socket.set_tcp_keepalive(&keepalive)
+        .map_err(|e| anyhow::anyhow!("设置 TCP keepalive 失败: {e}"))?;
+
+    // 阻塞 connect（socket2 同步 API），然后转 nonblocking 交给 tokio
+    socket.connect(&addr.into())
+        .map_err(|e| anyhow::anyhow!("TCP 连接失败: {e}"))?;
+    socket.set_nonblocking(true)
+        .map_err(|e| anyhow::anyhow!("set_nonblocking 失败: {e}"))?;
+    let std_stream: std::net::TcpStream = socket.into();
+    let tcp = tokio::net::TcpStream::from_std(std_stream)
+        .map_err(|e| anyhow::anyhow!("TcpStream::from_std 失败: {e}"))?;
+
+    // ── 2. TLS + WebSocket 握手（tokio-tungstenite 接管已连接的 stream）──────
+    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(
+        &config.console_url[..],
+        tcp,
+        None,
+        None,
+    ).await
         .map_err(|e| anyhow::anyhow!("WSS 连接失败: {e}"))?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -113,6 +155,33 @@ async fn connect_and_run(
 
     // 心跳发送 Task
     let beat_config = config.clone();
+    // pong 超时检测：服务端 10s 发一次 Ping，若 30s 未收到任何 Pong/数据则认为连接已死
+    let last_pong = Arc::new(AtomicI64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    ));
+    let pong_dead = Arc::new(AtomicBool::new(false));
+    let last_pong_c = Arc::clone(&last_pong);
+    let pong_dead_c = Arc::clone(&pong_dead);
+    // Watchdog：每 15s 检查一次，超过 45s 没有 Pong 则触发重连
+    tokio::spawn(async move {
+        let mut t = interval(Duration::from_secs(15));
+        loop {
+            t.tick().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if now - last_pong_c.load(Ordering::Relaxed) > 45 {
+                warn!("[KeepaliveWatchdog] 超过 45s 未收到 Pong/应用帧，标记连接为死亡");
+                pong_dead_c.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         loop {
@@ -128,6 +197,9 @@ async fn connect_and_run(
 
     // 主事件循环
     loop {
+        if pong_dead.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("[KeepaliveWatchdog] 连接心跳超时，触发重连"));
+        }
         tokio::select! {
             // 发送心跳
             Some(msg) = beat_rx.recv() => {
@@ -169,6 +241,14 @@ async fn connect_and_run(
                     None => return Err(anyhow::anyhow!("连接关闭")),
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(Message::Text(text))) => {
+                        // 收到任何应用帧 → 重置 pong watchdog
+                        last_pong.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64,
+                            Ordering::Relaxed,
+                        );
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if let Err(e) = handle_server_message(&val, &config, &claw_proxy, &mut write).await {
                                 warn!("处理 Console 消息失败: {e}");
@@ -177,6 +257,14 @@ async fn connect_and_run(
                     }
                     Some(Ok(Message::Close(_))) => return Ok(()),
                     Some(Ok(Message::Ping(d))) => {
+                        // 收到 Ping → 重置 pong watchdog + 回 Pong
+                        last_pong.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64,
+                            Ordering::Relaxed,
+                        );
                         write.send(Message::Pong(d)).await?;
                     }
                     _ => {}
