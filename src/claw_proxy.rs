@@ -51,30 +51,44 @@ impl ClawProxy {
         ClawProxy::new(self.port, &self.token)
     }
 
-    /// 订阅 OpenClaw WS 实时事件（health/tick），持续运行，断线重连
+    /// 订阅 OpenClaw WS 实时事件，持续运行，断线重连。
     ///
-    /// OpenClaw WS 不支持 auth 消息帧，token 通过 URL query param 传递。
-    /// 每 5s 主动发 Ping 帧，防止 OpenClaw 10s idle timeout 踢连。
-    /// 连接失败静默等 30s；断开后指数退避（3→6→12…最大 60s）。
+    /// **Daemon 自主感知**：每次连接前动态读 `/root/.openclaw/openclaw.json`，
+    /// 获取最新 token。daemon 可在 OpenClaw 安装前启动，感知到 token 后自动接入，
+    /// 无需 initnode.sh 手动写入或重启。
+    ///
+    /// - token 未就绪（OpenClaw 未安装）：静默等 30s 后重试
+    /// - 连接成功后每 5s 主动 Ping 保活，防止服务端 idle timeout
+    /// - 断开后指数退避（3→6→12…最大 60s）
     pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>) {
-        // 构建带 Authorization header 的 WS 握手请求
-        // OpenClaw token 模式要求在 HTTP Upgrade 请求头中携带 Bearer token
-        let ws_url = format!("ws://127.0.0.1:{}/ws", self.port);
-        let mut ws_req = ws_url.into_client_request()
-            .expect("WS URL 解析失败");
-        if !self.token.is_empty() {
-            ws_req.headers_mut().insert(
-                "Authorization",
-                format!("Bearer {}", self.token)
-                    .parse()
-                    .expect("Authorization header 解析失败"),
-            );
-        }
-
+        let ws_base = format!("ws://127.0.0.1:{}/ws", self.port);
         let mut retry_secs: u64 = 3;
 
         loop {
-            match connect_async(ws_req.clone()).await {
+            // 每次连接前动态读取最新 token（OpenClaw 可能在daemon启动后才安装）
+            let token = Self::read_claw_token_from_config();
+            if token.is_none() {
+                debug!("[ClawEvent] openclaw.json 不存在或 token 未配置，30s 后重试");
+                sleep(Duration::from_secs(30)).await;
+                retry_secs = 3;
+                continue;
+            }
+            let token = token.unwrap();
+
+            // 构建带 Authorization: Bearer <token> 的 WS 握手请求
+            let mut ws_req = match ws_base.clone().into_client_request() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[ClawEvent] WS URL 解析失败: {e}");
+                    sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+            ws_req.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}").parse().expect("header value parse"),
+            );
+            match connect_async(ws_req).await {
                 Err(e) => {
                     debug!("[ClawEvent] OpenClaw WS 连接失败 ({e})，30s 后重试");
                     sleep(Duration::from_secs(30)).await;
@@ -142,6 +156,14 @@ impl ClawProxy {
                 }
             }
         }
+    }
+
+    /// 从 /root/.openclaw/openclaw.json 动态读取 gateway.auth.token
+    /// 供 subscribe_events 每次连接前调用，感知 OpenClaw 安装后自动接入
+    fn read_claw_token_from_config() -> Option<String> {
+        let content = std::fs::read_to_string("/root/.openclaw/openclaw.json").ok()?;
+        let cfg: serde_json::Value = serde_json::from_str(&content).ok()?;
+        cfg["gateway"]["auth"]["token"].as_str().map(|s| s.to_string())
     }
 
     /// 检查 OpenClaw 是否可达（GET /v1/models）
