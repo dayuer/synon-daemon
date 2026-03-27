@@ -54,6 +54,10 @@ pub struct SysInfo {
     pub claw_running: bool,
     /// OpenClaw RPC (/api/status) 是否可达
     pub claw_rpc_ok: bool,
+    /// OpenClaw 当前安装版本
+    pub claw_version: Option<String>,
+    /// 是否有新版本可升级（仅当 claw_running=true 且查到 latest 版本时有效）
+    pub has_claw_update: bool,
     /// GNB 对等节点状态（gnb_ctl -s 原始输出，Console 端直接解析）
     pub gnb_status: String,
     /// GNB 地址表（gnb_ctl -a 原始输出）
@@ -97,6 +101,10 @@ pub async fn collect() -> Result<SysInfo> {
     // 进程检测
     let gnb_running  = is_process_running("gnb");
     let claw_running = is_process_running("openclaw");
+    // OpenClaw 版本（同步读取，无 IO 等待）
+    let claw_version = crate::claw_manager::read_local_version();
+    // has_claw_update 不在心跳里做网络查询（避免增加延迟）；Console 主动发 claw_status 时才查
+    let has_claw_update = false;
 
     // OpenClaw RPC 可用性（仅在进程运行时检查）
     let claw_port    = *CLAW_PORT.get().unwrap_or(&18789);
@@ -118,6 +126,7 @@ pub async fn collect() -> Result<SysInfo> {
         disk_percent, uptime_sec, hostname,
         os, kernel, arch, load, cpu_model, cpu_cores,
         gnb_running, claw_running, claw_rpc_ok,
+        claw_version, has_claw_update,
         gnb_status, gnb_addresses,
         installed_skills,
     })
@@ -279,6 +288,7 @@ pub fn is_process_running(name: &str) -> bool {
 
 /// 用于任务结果缓存文件（保留与 node-agent.sh 兼容的路径，供 exec_handler 写入）
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SkillEntry {
     pub id: String,
     pub name: String,

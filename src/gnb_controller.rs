@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use tracing::{info, warn};
 
 /// 更新 address.conf 并重载 GNB
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 ///   1. 写入临时文件 address.conf.tmp
 ///   2. 原子重命名为 address.conf
 ///   3. 查找 gnb 进程 PID 并发送 SIGHUP（平滑重载）
-pub fn apply_route_update(conf_dir: &PathBuf, address_conf: &str) -> Result<()> {
+pub fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<()> {
     let target = conf_dir.join("address.conf");
     let tmp    = conf_dir.join("address.conf.tmp");
 

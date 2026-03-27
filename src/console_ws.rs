@@ -11,11 +11,14 @@
 
 use crate::config::DaemonConfig;
 use crate::claw_proxy::{ClawProxy, ClawEvent};
+use crate::claw_manager;
+use crate::skills_manager;
 use crate::exec_handler;
 use crate::gnb_controller;
 use crate::heartbeat;
 use crate::gnb_monitor;
 use crate::watchdog::WatchdogAlert;
+
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -83,7 +86,7 @@ async fn connect_and_run(
         "gnbStatus": if gnb_status { "running" } else { "stopped" },
         "clawStatus": if claw_running { "running" } else { "stopped" },
     });
-    write.send(Message::Text(hello.to_string().into())).await?;
+    write.send(Message::Text(hello.to_string())).await?;
 
     // 2. 等待 hello-ack
     let ack = tokio::time::timeout(Duration::from_secs(10), read.next())
@@ -128,7 +131,7 @@ async fn connect_and_run(
         tokio::select! {
             // 发送心跳
             Some(msg) = beat_rx.recv() => {
-                write.send(Message::Text(msg.into())).await?;
+                write.send(Message::Text(msg)).await?;
                 debug!("心跳已发送");
             }
 
@@ -144,7 +147,7 @@ async fn connect_and_run(
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0),
                 });
-                write.send(Message::Text(msg.to_string().into())).await?;
+                write.send(Message::Text(msg.to_string())).await?;
             }
 
             // 发送 watchdog 告警
@@ -157,7 +160,7 @@ async fn connect_and_run(
                     "restarted": alert.restarted,
                     "ts": alert.ts,
                 });
-                write.send(Message::Text(msg.to_string().into())).await?;
+                write.send(Message::Text(msg.to_string())).await?;
             }
 
             // 接收 Console 下行消息
@@ -207,7 +210,7 @@ async fn handle_server_message(
                 "ok": result.is_ok(),
                 "payload": result.unwrap_or_else(|e| json!({ "error": e.to_string() })),
             });
-            write.send(Message::Text(resp.to_string().into())).await?;
+            write.send(Message::Text(resp.to_string())).await?;
         }
 
         // 路由拓扑更新（Phase 2）
@@ -217,15 +220,15 @@ async fn handle_server_message(
                     .map_err(|e| warn!("应用 route_update 失败: {e}"))
                     .is_ok();
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
-                write.send(Message::Text(resp.to_string().into())).await?;
+                write.send(Message::Text(resp.to_string())).await?;
             }
         }
 
         // 密钥滚动更新
         "key_rotate" => {
-            let ok = handle_key_rotate(&msg).is_ok();
+            let ok = handle_key_rotate(msg).is_ok();
             let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
-            write.send(Message::Text(resp.to_string().into())).await?;
+            write.send(Message::Text(resp.to_string())).await?;
         }
 
         // 受限命令执行（Phase 3）
@@ -245,7 +248,7 @@ async fn handle_server_message(
                 "stdout": result.stdout,
                 "stderr": result.stderr,
             });
-            write.send(Message::Text(resp.to_string().into())).await?;
+            write.send(Message::Text(resp.to_string())).await?;
         }
 
         // 文件分发（Phase 3）
@@ -260,10 +263,128 @@ async fn handle_server_message(
                 "ok": result.is_ok(),
                 "stderr": result.err().map(|e| e.to_string()).unwrap_or_default(),
             });
-            write.send(Message::Text(resp.to_string().into())).await?;
+            write.send(Message::Text(resp.to_string())).await?;
+        }
+
+
+        // ═══════════════════════════════════════════
+        // OpenClaw 生命周期管理（claw_manager）
+        // ═══════════════════════════════════════════
+
+        // 查询 OpenClaw 完整状态
+        "claw_status" => {
+            let status = claw_manager::get_full_status(config.claw_port).await;
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": true,
+                "payload": serde_json::to_value(&status).unwrap_or(Value::Null),
+            });
+            write.send(Message::Text(resp.to_string())).await?;
+        }
+
+        // 升级 OpenClaw（可选指定版本）
+        "claw_upgrade" => {
+            let version = msg["version"].as_str();
+            let result = claw_manager::upgrade(version).await;
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": result.is_ok(),
+                "payload": result.unwrap_or_else(|e| e.to_string()),
+            });
+            write.send(Message::Text(resp.to_string())).await?;
+        }
+
+        // 重启 openclaw-gateway
+        "claw_restart" => {
+            let result = claw_manager::restart().await;
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": result.is_ok(),
+                "payload": result.err().map(|e| e.to_string()),
+            });
+            write.send(Message::Text(resp.to_string())).await?;
+        }
+
+        // ═══════════════════════════════════════════
+        // Skills 生命周期管理（skills_manager）
+        // ═══════════════════════════════════════════
+
+        // 列出已安装技能
+        "skill_list" => {
+            // 先尝试 CLI 实时查询并刷新缓存；如果 OpenClaw 未运行则降级到缓存
+            let skills = if claw.ping().await {
+                skills_manager::refresh_cache().await.unwrap_or_else(|_| skills_manager::list_from_cache())
+            } else {
+                skills_manager::list_from_cache()
+            };
+            let resp = json!({
+                "type": "cmd_result",
+                "reqId": req_id,
+                "ok": true,
+                "payload": skills,
+            });
+            write.send(Message::Text(resp.to_string())).await?;
+        }
+
+        // 安装技能
+        "skill_install" => {
+            let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
+            if skill_id.is_empty() {
+                let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
+                write.send(Message::Text(resp.to_string())).await?;
+            } else {
+                let result = skills_manager::install(&skill_id).await;
+                let resp = json!({
+                    "type": "cmd_result",
+                    "reqId": req_id,
+                    "ok": result.is_ok(),
+                    "payload": result.unwrap_or_else(|e| e.to_string()),
+                });
+                write.send(Message::Text(resp.to_string())).await?;
+            }
+        }
+
+        // 卸载技能
+        "skill_uninstall" => {
+            let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
+            if skill_id.is_empty() {
+                let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
+                write.send(Message::Text(resp.to_string())).await?;
+            } else {
+                let result = skills_manager::uninstall(&skill_id).await;
+                let resp = json!({
+                    "type": "cmd_result",
+                    "reqId": req_id,
+                    "ok": result.is_ok(),
+                    "payload": result.unwrap_or_else(|e| e.to_string()),
+                });
+                write.send(Message::Text(resp.to_string())).await?;
+            }
+        }
+
+        // 更新技能
+        "skill_update" => {
+            let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
+            if skill_id.is_empty() {
+                let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
+                write.send(Message::Text(resp.to_string())).await?;
+            } else {
+                let result = skills_manager::update(&skill_id).await;
+                let resp = json!({
+                    "type": "cmd_result",
+                    "reqId": req_id,
+                    "ok": result.is_ok(),
+                    "payload": result.unwrap_or_else(|e| e.to_string()),
+                });
+                write.send(Message::Text(resp.to_string())).await?;
+            }
         }
 
         unknown => debug!("收到未知消息类型: {unknown}"),
+
     }
     Ok(())
 }

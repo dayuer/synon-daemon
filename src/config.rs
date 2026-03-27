@@ -20,6 +20,7 @@ pub struct DaemonConfig {
     /// GNB mmap map 路径（用于 gnb_ctl）
     pub gnb_map_path: PathBuf,
     /// OpenClaw 配置文件路径
+#[allow(dead_code)]
     pub claw_config_path: PathBuf,
     /// OpenClaw 网关端口（默认 18789）
     pub claw_port: u16,
@@ -29,6 +30,7 @@ pub struct DaemonConfig {
 
 /// agent.conf 环境文件结构（由 initnode.sh 生成）
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AgentEnv {
     #[serde(rename = "CONSOLE_URL")]
     console_url: Option<String>,
@@ -51,6 +53,7 @@ struct OpenClawConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OpenClawGateway {
     port: Option<u16>,
     auth: Option<OpenClawAuth>,

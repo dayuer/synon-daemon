@@ -69,7 +69,7 @@ impl ClawProxy {
 
                     // 发送认证帧
                     let auth = json!({ "type": "auth", "token": token });
-                    if write.send(Message::Text(auth.to_string().into())).await.is_err() {
+                    if write.send(Message::Text(auth.to_string())).await.is_err() {
                         warn!("[ClawEvent] 发送 auth 帧失败");
                         sleep(Duration::from_secs(5)).await;
                         continue;

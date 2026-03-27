@@ -8,6 +8,8 @@
 mod config;
 mod console_ws;
 mod claw_proxy;
+mod claw_manager;
+mod skills_manager;
 mod exec_handler;
 mod gnb_controller;
 mod gnb_monitor;
@@ -83,3 +85,4 @@ async fn main() {
     // 启动 Console WSS 连接（含自动重连）
     console_ws::run(config, alert_rx).await;
 }
+

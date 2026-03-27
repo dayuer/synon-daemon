@@ -16,7 +16,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Sha256, Digest};
 use tokio::time::sleep;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60; // 24 小时

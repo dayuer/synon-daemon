@@ -5,7 +5,7 @@
 //!   2. 危险模式黑名单二次校验（防止绕过）
 //!   3. 执行命令，60 秒超时，返回 { code, stdout, stderr }
 
-use anyhow::Result;
+// use anyhow::Result; // removed: unused
 use serde::Serialize;
 use std::time::Duration;
 use tokio::process::Command;
@@ -55,8 +55,11 @@ const ALLOWED_PREFIXES: &[&str] = &[
     // GNB / OpenClaw 相关
     "gnb ",
     "/opt/gnb/bin/gnb",
-    "openclaw ",
+    "openclaw ",          // 覆盖所有 openclaw 子命令（skills/gateway/config 等）
     "clawhub ",
+    // npm 全局安装（OpenClaw 升级专用）
+    "npm install -g openclaw",
+    "npm install -g n",
     // 系统信息（只读）
     "which ",
     "test ",

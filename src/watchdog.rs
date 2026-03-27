@@ -51,7 +51,7 @@ pub async fn run(
 /// 检查单个服务，超过 30 秒宕机则重启
 async fn check_service(
     name: &str,
-    restart_cmd: &str,
+    _restart_cmd: &str,
     down_since: &mut Option<Instant>,
     node_id: &str,
     alert_tx: &tokio::sync::mpsc::Sender<WatchdogAlert>,
