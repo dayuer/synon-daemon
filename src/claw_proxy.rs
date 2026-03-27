@@ -99,6 +99,37 @@ impl ClawProxy {
                     info!("[ClawEvent] 已连接 OpenClaw WS");
                     let (mut write, mut read) = ws_stream.split();
 
+                    // OpenClaw WS 应用层握手：连接后必须在 handshakeTimeoutMs（默认10s）内
+                    // 发送 method=connect 的 JSON-RPC 请求，否则服务端踢掉。
+                    // ConnectParamsSchema（逆向自 method-scopes-DhuXuLfv.js）：
+                    //   minProtocol/maxProtocol: integer
+                    //   client: { id, version, platform, mode }
+                    //   auth: { token }（optional）
+                    let connect_msg = serde_json::json!({
+                        "id": 1,
+                        "method": "connect",
+                        "params": {
+                            "minProtocol": 1,
+                            "maxProtocol": 99,
+                            "client": {
+                                "id": "gateway-client",
+                                "version": "0.1.0",
+                                "platform": "linux",
+                                "mode": "backend"
+                            },
+                            "auth": {
+                                "token": token
+                            }
+                        }
+                    });
+                    if write.send(Message::Text(connect_msg.to_string())).await.is_err() {
+                        warn!("[ClawEvent] 发送 connect 消息失败");
+                        sleep(Duration::from_secs(retry_secs)).await;
+                        retry_secs = (retry_secs * 2).min(60);
+                        continue;
+                    }
+                    debug!("[ClawEvent] connect 消息已发送，等待 hello-ok");
+
                     while let Some(msg) = read.next().await {
                         let text = match msg {
                             Ok(Message::Text(t)) => t.to_string(),
