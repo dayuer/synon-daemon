@@ -13,10 +13,10 @@ use crate::config::DaemonConfig;
 use crate::claw_proxy::{ClawProxy, ClawEvent};
 use crate::claw_manager;
 use crate::skills_manager;
-use crate::exec_handler;
 use crate::gnb_controller;
 use crate::heartbeat;
 use crate::gnb_monitor;
+use crate::task_executor::{self, TaskMessage};
 use crate::watchdog::WatchdogAlert;
 
 
@@ -153,8 +153,32 @@ async fn connect_and_run(
 
     // 3. 重连成功，重置退避计数（通过返回正常退出触发）
     let config = config.clone();
-    let (beat_tx, mut beat_rx) = mpsc::channel::<String>(8);
     let (claw_evt_tx, mut claw_evt_rx) = mpsc::channel::<ClawEvent>(32);
+
+    // ── 并发架构：WS write 解耦 + 串行执行器 ──────────────────────────
+    // resp_tx：所有需要写 WS 的操作通过此 channel 投递（解耦 write half）
+    // task_tx：耗时命令入队，由串行执行器逐个执行
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(64);
+    let (task_tx, task_rx) = mpsc::channel::<TaskMessage>(16);
+    let in_flight = task_executor::new_in_flight();
+
+    // WS write loop（独立 task，消费 resp_rx → 写入 WS）
+    tokio::spawn(async move {
+        while let Some(msg) = resp_rx.recv().await {
+            if write.send(msg).await.is_err() {
+                warn!("[WsWriteLoop] WS 写入失败，退出");
+                break;
+            }
+        }
+        debug!("[WsWriteLoop] 退出");
+    });
+
+    // 串行任务执行器（独立 task，消费 task_rx → 执行 → resp_tx 回写）
+    let exec_resp_tx = resp_tx.clone();
+    let exec_in_flight = in_flight.clone();
+    tokio::spawn(async move {
+        task_executor::run(task_rx, exec_resp_tx, exec_in_flight).await;
+    });
 
     // 订阅 OpenClaw 实时事件（health/tick）
     let claw_for_events = claw_proxy.clone_for_events();
@@ -162,9 +186,10 @@ async fn connect_and_run(
         claw_for_events.subscribe_events(claw_evt_tx).await;
     });
 
-    // 心跳发送 Task
+    // 心跳发送 Task（含 systemd watchdog 通知）
     let beat_config = config.clone();
-    // pong 超时检测：服务端 10s 发一次 Ping，若 30s 未收到任何 Pong/数据则认为连接已死
+    let beat_resp_tx = resp_tx.clone();
+    // pong 超时检测：服务端 10s 发一次 Ping，若 45s 未收到任何 Pong/数据则认为连接已死
     let last_pong = Arc::new(AtomicI64::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -195,27 +220,23 @@ async fn connect_and_run(
         let mut ticker = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         loop {
             ticker.tick().await;
+            // systemd watchdog 心跳（WatchdogSec=30，此处 10s 触发，3x 余量）
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
             match build_heartbeat(&beat_config).await {
                 Ok(msg) => {
-                    if beat_tx.send(msg).await.is_err() { break; }
+                    if beat_resp_tx.send(Message::Text(msg)).await.is_err() { break; }
                 }
                 Err(e) => warn!("心跳采集失败: {e}"),
             }
         }
     });
 
-    // 主事件循环
+    // ── 主事件循环（轻量派发，不阻塞耗时操作）────────────────────────
     loop {
         if pong_dead.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!("[KeepaliveWatchdog] 连接心跳超时，触发重连"));
         }
         tokio::select! {
-            // 发送心跳
-            Some(msg) = beat_rx.recv() => {
-                write.send(Message::Text(msg)).await?;
-                debug!("心跳已发送");
-            }
-
             // 转发 claw_event 给 Console
             Some(evt) = claw_evt_rx.recv() => {
                 let msg = json!({
@@ -228,7 +249,7 @@ async fn connect_and_run(
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0),
                 });
-                write.send(Message::Text(msg.to_string())).await?;
+                resp_tx.send(Message::Text(msg.to_string())).await.ok();
             }
 
             // 发送 watchdog 告警
@@ -241,7 +262,7 @@ async fn connect_and_run(
                     "restarted": alert.restarted,
                     "ts": alert.ts,
                 });
-                write.send(Message::Text(msg.to_string())).await?;
+                resp_tx.send(Message::Text(msg.to_string())).await.ok();
             }
 
             // 接收 Console 下行消息
@@ -259,7 +280,10 @@ async fn connect_and_run(
                             Ordering::Relaxed,
                         );
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                            if let Err(e) = handle_server_message(&val, &config, &claw_proxy, &mut write).await {
+                            if let Err(e) = handle_server_message(
+                                &val, &config, &claw_proxy,
+                                &resp_tx, &task_tx, &in_flight,
+                            ).await {
                                 warn!("处理 Console 消息失败: {e}");
                             }
                         }
@@ -274,7 +298,7 @@ async fn connect_and_run(
                                 .as_secs() as i64,
                             Ordering::Relaxed,
                         );
-                        write.send(Message::Pong(d)).await?;
+                        resp_tx.send(Message::Pong(d)).await.ok();
                     }
                     _ => {}
                 }
@@ -284,11 +308,16 @@ async fn connect_and_run(
 }
 
 /// 处理来自 Console 的下行消息
+///
+/// 快速消息（<100ms）就地 await + resp_tx 回写
+/// 耗时消息（exec_cmd / skill / claw 操作）→ task_tx 入队串行执行
 async fn handle_server_message(
     msg: &Value,
     config: &DaemonConfig,
     claw: &ClawProxy,
-    write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    resp_tx: &mpsc::Sender<Message>,
+    task_tx: &mpsc::Sender<TaskMessage>,
+    in_flight: &task_executor::InFlight,
 ) -> Result<()> {
     let msg_type = msg["type"].as_str().unwrap_or("");
     let req_id = msg.get("reqId").cloned().unwrap_or(Value::Null);
@@ -296,7 +325,9 @@ async fn handle_server_message(
     match msg_type {
         "pong" => {} // 保活响应，忽略
 
-        // OpenClaw RPC 代理（Phase 2）
+        // ═══ 快速路径（就地 await）═══════════════════════════════════
+
+        // OpenClaw RPC 代理
         "claw_rpc" => {
             let method = msg["method"].as_str().unwrap_or("status");
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -307,17 +338,18 @@ async fn handle_server_message(
                 "ok": result.is_ok(),
                 "payload": result.unwrap_or_else(|e| json!({ "error": e.to_string() })),
             });
-            write.send(Message::Text(resp.to_string())).await?;
+            resp_tx.send(Message::Text(resp.to_string())).await
+                .map_err(|_| anyhow::anyhow!("WS write 通道关闭"))?;
         }
 
-        // 路由拓扑更新（Phase 2）
+        // 路由拓扑更新
         "route_update" => {
             if let Some(conf) = msg["addressConf"].as_str() {
                 let ok = gnb_controller::apply_route_update(&config.gnb_conf_dir, conf)
                     .map_err(|e| warn!("应用 route_update 失败: {e}"))
                     .is_ok();
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
-                write.send(Message::Text(resp.to_string())).await?;
+                resp_tx.send(Message::Text(resp.to_string())).await.ok();
             }
         }
 
@@ -325,34 +357,13 @@ async fn handle_server_message(
         "key_rotate" => {
             let ok = handle_key_rotate(msg).is_ok();
             let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
-            write.send(Message::Text(resp.to_string())).await?;
+            resp_tx.send(Message::Text(resp.to_string())).await.ok();
         }
 
-        // 受限命令执行（Phase 3）
-        "exec_cmd" => {
-            let command = msg["command"].as_str().unwrap_or("");
-            let allowed_extra: Vec<&str> = msg["allowedCmds"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-
-            let result = exec_handler::exec_allowed(command, &allowed_extra).await;
-            let resp = json!({
-                "type": "cmd_result",
-                "reqId": req_id,
-                "ok": result.code == 0,
-                "code": result.code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            });
-            write.send(Message::Text(resp.to_string())).await?;
-        }
-
-        // 文件分发（Phase 3）
+        // 文件分发
         "deploy_file" => {
             let path_str = msg["path"].as_str().unwrap_or("");
             let content_b64 = msg["content_b64"].as_str().unwrap_or("");
-
             let result = handle_deploy_file(path_str, content_b64);
             let resp = json!({
                 "type": "cmd_result",
@@ -360,13 +371,8 @@ async fn handle_server_message(
                 "ok": result.is_ok(),
                 "stderr": result.err().map(|e| e.to_string()).unwrap_or_default(),
             });
-            write.send(Message::Text(resp.to_string())).await?;
+            resp_tx.send(Message::Text(resp.to_string())).await.ok();
         }
-
-
-        // ═══════════════════════════════════════════
-        // OpenClaw 生命周期管理（claw_manager）
-        // ═══════════════════════════════════════════
 
         // 查询 OpenClaw 完整状态
         "claw_status" => {
@@ -377,41 +383,11 @@ async fn handle_server_message(
                 "ok": true,
                 "payload": serde_json::to_value(&status).unwrap_or(Value::Null),
             });
-            write.send(Message::Text(resp.to_string())).await?;
+            resp_tx.send(Message::Text(resp.to_string())).await.ok();
         }
-
-        // 升级 OpenClaw（可选指定版本）
-        "claw_upgrade" => {
-            let version = msg["version"].as_str();
-            let result = claw_manager::upgrade(version).await;
-            let resp = json!({
-                "type": "cmd_result",
-                "reqId": req_id,
-                "ok": result.is_ok(),
-                "payload": result.unwrap_or_else(|e| e.to_string()),
-            });
-            write.send(Message::Text(resp.to_string())).await?;
-        }
-
-        // 重启 openclaw-gateway
-        "claw_restart" => {
-            let result = claw_manager::restart().await;
-            let resp = json!({
-                "type": "cmd_result",
-                "reqId": req_id,
-                "ok": result.is_ok(),
-                "payload": result.err().map(|e| e.to_string()),
-            });
-            write.send(Message::Text(resp.to_string())).await?;
-        }
-
-        // ═══════════════════════════════════════════
-        // Skills 生命周期管理（skills_manager）
-        // ═══════════════════════════════════════════
 
         // 列出已安装技能
         "skill_list" => {
-            // 先尝试 CLI 实时查询并刷新缓存；如果 OpenClaw 未运行则降级到缓存
             let skills = if claw.ping().await {
                 skills_manager::refresh_cache().await.unwrap_or_else(|_| skills_manager::list_from_cache())
             } else {
@@ -423,7 +399,22 @@ async fn handle_server_message(
                 "ok": true,
                 "payload": skills,
             });
-            write.send(Message::Text(resp.to_string())).await?;
+            resp_tx.send(Message::Text(resp.to_string())).await.ok();
+        }
+
+        // ═══ 慢速路径（入队串行执行器）═══════════════════════════════
+
+        // 受限命令执行
+        "exec_cmd" => {
+            let command = msg["command"].as_str().unwrap_or("").to_string();
+            let allowed_extra: Vec<String> = msg["allowedCmds"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            dispatch_slow(
+                TaskMessage::ExecCmd { req_id, command, allowed_extra },
+                task_tx, resp_tx, in_flight,
+            ).await?;
         }
 
         // 安装技能
@@ -431,16 +422,12 @@ async fn handle_server_message(
             let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
             if skill_id.is_empty() {
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
-                write.send(Message::Text(resp.to_string())).await?;
+                resp_tx.send(Message::Text(resp.to_string())).await.ok();
             } else {
-                let result = skills_manager::install(&skill_id).await;
-                let resp = json!({
-                    "type": "cmd_result",
-                    "reqId": req_id,
-                    "ok": result.is_ok(),
-                    "payload": result.unwrap_or_else(|e| e.to_string()),
-                });
-                write.send(Message::Text(resp.to_string())).await?;
+                dispatch_slow(
+                    TaskMessage::SkillInstall { req_id, skill_id },
+                    task_tx, resp_tx, in_flight,
+                ).await?;
             }
         }
 
@@ -449,16 +436,12 @@ async fn handle_server_message(
             let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
             if skill_id.is_empty() {
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
-                write.send(Message::Text(resp.to_string())).await?;
+                resp_tx.send(Message::Text(resp.to_string())).await.ok();
             } else {
-                let result = skills_manager::uninstall(&skill_id).await;
-                let resp = json!({
-                    "type": "cmd_result",
-                    "reqId": req_id,
-                    "ok": result.is_ok(),
-                    "payload": result.unwrap_or_else(|e| e.to_string()),
-                });
-                write.send(Message::Text(resp.to_string())).await?;
+                dispatch_slow(
+                    TaskMessage::SkillUninstall { req_id, skill_id },
+                    task_tx, resp_tx, in_flight,
+                ).await?;
             }
         }
 
@@ -467,21 +450,66 @@ async fn handle_server_message(
             let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
             if skill_id.is_empty() {
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
-                write.send(Message::Text(resp.to_string())).await?;
+                resp_tx.send(Message::Text(resp.to_string())).await.ok();
             } else {
-                let result = skills_manager::update(&skill_id).await;
-                let resp = json!({
-                    "type": "cmd_result",
-                    "reqId": req_id,
-                    "ok": result.is_ok(),
-                    "payload": result.unwrap_or_else(|e| e.to_string()),
-                });
-                write.send(Message::Text(resp.to_string())).await?;
+                dispatch_slow(
+                    TaskMessage::SkillUpdate { req_id, skill_id },
+                    task_tx, resp_tx, in_flight,
+                ).await?;
             }
         }
 
-        unknown => debug!("收到未知消息类型: {unknown}"),
+        // 升级 OpenClaw
+        "claw_upgrade" => {
+            let version = msg["version"].as_str().map(String::from);
+            dispatch_slow(
+                TaskMessage::ClawUpgrade { req_id, version },
+                task_tx, resp_tx, in_flight,
+            ).await?;
+        }
 
+        // 重启 openclaw-gateway
+        "claw_restart" => {
+            dispatch_slow(
+                TaskMessage::ClawRestart { req_id },
+                task_tx, resp_tx, in_flight,
+            ).await?;
+        }
+
+        unknown => debug!("收到未知消息类型: {unknown}"),
+    }
+    Ok(())
+}
+
+/// 派发耗时任务到串行执行器（含 reqId 去重 + 队列背压处理）
+async fn dispatch_slow(
+    task: TaskMessage,
+    task_tx: &mpsc::Sender<TaskMessage>,
+    resp_tx: &mpsc::Sender<Message>,
+    in_flight: &task_executor::InFlight,
+) -> Result<()> {
+    let req_id_s = task.req_id_str();
+
+    // 去重检查
+    if !task_executor::try_claim(in_flight, &req_id_s) {
+        let resp = json!({ "type": "cmd_result", "reqId": req_id_s, "ok": false, "stderr": "任务已在执行中" });
+        resp_tx.send(Message::Text(resp.to_string())).await.ok();
+        return Ok(());
+    }
+
+    // 非阻塞入队（防止背压阻塞 read loop）
+    match task_tx.try_send(task) {
+        Ok(()) => {} // 入队成功
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // 队列满，释放 in-flight 标记
+            if let Ok(mut set) = in_flight.lock() { set.remove(&req_id_s); }
+            let resp = json!({ "type": "cmd_result", "reqId": req_id_s, "ok": false, "stderr": "任务队列已满，请稍后重试" });
+            resp_tx.send(Message::Text(resp.to_string())).await.ok();
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            if let Ok(mut set) = in_flight.lock() { set.remove(&req_id_s); }
+            return Err(anyhow::anyhow!("任务执行器已关闭"));
+        }
     }
     Ok(())
 }

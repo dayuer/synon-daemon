@@ -16,6 +16,7 @@ mod gnb_monitor;
 mod heartbeat;
 mod self_updater;
 mod watchdog;
+mod task_executor;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
