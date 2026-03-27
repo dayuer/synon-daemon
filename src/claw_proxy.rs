@@ -106,7 +106,8 @@ impl ClawProxy {
                     //   client: { id, version, platform, mode }
                     //   auth: { token }（optional）
                     let connect_msg = serde_json::json!({
-                        "id": 1,
+                        "type": "req",       // RequestFrameSchema 必填：type = "req"
+                        "id": "1",           // id 必须是 NonEmptyString，不能是整数
                         "method": "connect",
                         "params": {
                             "minProtocol": 1,
