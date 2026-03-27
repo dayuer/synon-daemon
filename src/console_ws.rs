@@ -37,10 +37,11 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const RECONNECT_BASE_SECS: u64 = 3;
 const RECONNECT_MAX_SECS: u64 = 60;
 
-/// 运行 Console WSS 连接（含自动重连指数退避）
+/// 运行 Console WSS 连接（含自动重连指数退避 + 优雅关闭）
 pub async fn run(
     config: DaemonConfig,
     alert_rx: mpsc::Receiver<WatchdogAlert>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut alert_rx = alert_rx;
     let mut retry_secs = RECONNECT_BASE_SECS;
@@ -55,7 +56,15 @@ pub async fn run(
                 warn!("Console 连接断开: {e}，{retry_secs}s 后重连...");
             }
         }
-        sleep(Duration::from_secs(retry_secs)).await;
+
+        // 重连前检查关闭信号
+        tokio::select! {
+            _ = sleep(Duration::from_secs(retry_secs)) => {}
+            _ = shutdown.cancelled() => {
+                info!("收到关闭信号，停止 WSS 重连");
+                break;
+            }
+        }
         retry_secs = (retry_secs * 2).min(RECONNECT_MAX_SECS);
     }
 }

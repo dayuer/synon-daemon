@@ -23,12 +23,19 @@ pub struct WatchdogAlert {
 pub async fn run(
     node_id: String,
     alert_tx: tokio::sync::mpsc::Sender<WatchdogAlert>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut gnb_down_since: Option<Instant> = None;
     let mut claw_down_since: Option<Instant> = None;
 
     loop {
-        sleep(Duration::from_secs(10)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(10)) => {}
+            _ = shutdown.cancelled() => {
+                info!("[Watchdog] 收到关闭信号，退出");
+                break;
+            }
+        }
 
         check_service(
             "gnb",

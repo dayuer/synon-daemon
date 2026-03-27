@@ -26,6 +26,8 @@ tokio-retry = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 libc = "0.2"
+tokio-util = "0.7"
+sd-notify = "0.4"
 
 [profile.release]
 opt-level = "z"       # 最小二进制体积

@@ -199,12 +199,11 @@ mod tests {
 
     #[test]
     fn test_parse_skills_json_valid() {
-        let json = r#"[{"id":"test-skill","name":"测试技能","version":"1.0.0","enabled":true,"source":"npm"}]"#;
+        let json = r#"[{"name":"测试技能","description":"一个测试技能","source":"npm"}]"#;
         let skills: Vec<SkillInfo> = serde_json::from_str(json).unwrap();
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].id, "test-skill");
-        assert_eq!(skills[0].version, "1.0.0");
-        assert!(skills[0].enabled);
+        assert_eq!(skills[0].name, "测试技能");
+        assert_eq!(skills[0].source, "npm");
     }
 
     #[test]
@@ -215,11 +214,11 @@ mod tests {
 
     #[test]
     fn test_parse_skills_json_minimal_fields() {
-        // 只有必选字段，enabled/source 有默认值
-        let json = r#"[{"id":"s1","name":"S1","version":"0.1.0"}]"#;
+        // 只有 name 必选，其他有默认值
+        let json = r#"[{"name":"s1"}]"#;
         let skills: Vec<SkillInfo> = serde_json::from_str(json).unwrap();
-        assert_eq!(skills[0].id, "s1");
-        assert!(!skills[0].enabled); // default false
+        assert_eq!(skills[0].name, "s1");
+        assert!(!skills[0].disabled); // default false
         assert_eq!(skills[0].source, ""); // default ""
     }
 

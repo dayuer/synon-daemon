@@ -40,25 +40,32 @@ fn arch_tag() -> &'static str {
 }
 
 /// 运行自动更新循环（阻塞，应在独立 tokio task 中运行）
-pub async fn run(config: DaemonConfig) {
+pub async fn run(config: DaemonConfig, shutdown: tokio_util::sync::CancellationToken) {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
     // 启动后等待 5 分钟再做第一次检查（避免启动风暴）
-    sleep(Duration::from_secs(5 * 60)).await;
+    tokio::select! {
+        _ = sleep(Duration::from_secs(5 * 60)) => {}
+        _ = shutdown.cancelled() => { return; }
+    }
 
     loop {
-        if let Err(e) = check_and_update(&config, &client).await {
-            warn!("[SelfUpdater] 更新检查失败: {e}，将在 24h 后重试");
+        match check_and_update(&config, &client, &shutdown).await {
+            Ok(()) => {}
+            Err(e) => warn!("[SelfUpdater] 更新检查失败: {e}，将在 24h 后重试"),
         }
-        sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(CHECK_INTERVAL_SECS)) => {}
+            _ = shutdown.cancelled() => { break; }
+        }
     }
 }
 
 /// 单次检查并更新（可失败）
-async fn check_and_update(config: &DaemonConfig, client: &Client) -> Result<()> {
+async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tokio_util::sync::CancellationToken) -> Result<()> {
     // 1. 查询最新版本元数据
     let meta_url = format!(
         "{}/api/mirror/synon-daemon/latest?arch={}&current={}",
@@ -144,14 +151,9 @@ async fn check_and_update(config: &DaemonConfig, client: &Client) -> Result<()> 
 
     info!("[SelfUpdater] 新版本 v{} 已就位，正在重启...", meta.version);
 
-    // 5. 触发重启（systemd 会重新拉起）
-    // 使用 kill -SIGTERM 自身，让进程优雅退出
-    unsafe {
-        libc::kill(libc::getpid(), libc::SIGTERM);
-    }
-
-    // 等待信号处理
-    sleep(Duration::from_secs(2)).await;
+    // 5. 触发优雅关闭 → systemd Restart=always 自动拉起新版本
+    // 不再使用 unsafe libc::kill，通过 CancellationToken 通知主进程优雅退出
+    shutdown.cancel();
 
     Ok(())
 }
