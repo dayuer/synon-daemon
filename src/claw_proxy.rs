@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, info, warn};
 
 pub struct ClawProxy {
@@ -56,16 +57,24 @@ impl ClawProxy {
     /// 每 5s 主动发 Ping 帧，防止 OpenClaw 10s idle timeout 踢连。
     /// 连接失败静默等 30s；断开后指数退避（3→6→12…最大 60s）。
     pub async fn subscribe_events(&self, event_tx: mpsc::Sender<ClawEvent>) {
-        let ws_url = if self.token.is_empty() {
-            format!("ws://127.0.0.1:{}/ws", self.port)
-        } else {
-            format!("ws://127.0.0.1:{}/ws?token={}", self.port, self.token)
-        };
+        // 构建带 Authorization header 的 WS 握手请求
+        // OpenClaw token 模式要求在 HTTP Upgrade 请求头中携带 Bearer token
+        let ws_url = format!("ws://127.0.0.1:{}/ws", self.port);
+        let mut ws_req = ws_url.into_client_request()
+            .expect("WS URL 解析失败");
+        if !self.token.is_empty() {
+            ws_req.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", self.token)
+                    .parse()
+                    .expect("Authorization header 解析失败"),
+            );
+        }
 
         let mut retry_secs: u64 = 3;
 
         loop {
-            match connect_async(&ws_url).await {
+            match connect_async(ws_req.clone()).await {
                 Err(e) => {
                     debug!("[ClawEvent] OpenClaw WS 连接失败 ({e})，30s 后重试");
                     sleep(Duration::from_secs(30)).await;
