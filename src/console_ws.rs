@@ -393,9 +393,12 @@ async fn handle_server_message(
         // 列出已安装技能
         "skill_list" => {
             let skills = if claw.ping().await {
-                skills_manager::refresh_cache().await.unwrap_or_else(|_| skills_manager::list_from_cache())
+                match skills_manager::refresh_cache().await {
+                    Ok(s) => s,
+                    Err(_) => skills_manager::list_from_cache().await,
+                }
             } else {
-                skills_manager::list_from_cache()
+                skills_manager::list_from_cache().await
             };
             let resp = json!({
                 "type": "cmd_result",

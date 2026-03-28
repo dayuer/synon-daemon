@@ -123,7 +123,7 @@ pub async fn collect() -> Result<SysInfo> {
     let (gnb_status, gnb_addresses) = read_gnb_status(map_path);
 
     // skills 缓存（读 /opt/gnb/cache/skills.json）
-    let installed_skills = read_skills_cache();
+    let installed_skills = read_skills_cache().await;
 
     Ok(SysInfo {
         ts, cpu_percent, mem_percent, mem_used_mb, mem_total_mb,
@@ -335,9 +335,9 @@ async fn check_claw_rpc(port: u16) -> bool {
 }
 
 /// skills 缓存：读 /opt/gnb/cache/skills.json（与 node-agent.sh 格式一致）
-fn read_skills_cache() -> Vec<serde_json::Value> {
+async fn read_skills_cache() -> Vec<serde_json::Value> {
     const CACHE: &str = "/opt/gnb/cache/skills.json";
-    let content = fs::read_to_string(CACHE).unwrap_or_default();
+    let content = tokio::fs::read_to_string(CACHE).await.unwrap_or_default();
     serde_json::from_str::<Vec<serde_json::Value>>(&content).unwrap_or_default()
 }
 
@@ -364,7 +364,7 @@ pub struct SkillEntry {
 }
 
 /// 技能操作完成后失效 skills 缓存
-pub fn invalidate_skills_cache() {
-    let _ = fs::remove_file("/opt/gnb/cache/skills.json");
+pub async fn invalidate_skills_cache() {
+    let _ = tokio::fs::remove_file("/opt/gnb/cache/skills.json").await;
     debug!("skills.json 缓存已失效");
 }

@@ -41,14 +41,14 @@ pub struct SkillInfo {
     pub homepage: String,
 }
 
-/// 从本地 skills.json 缓存读取已安装技能列表（秒级，无 IO 等待）
-pub fn list_from_cache() -> Vec<SkillInfo> {
+/// 从本地 skills.json 缓存读取已安装技能列表（异步）
+pub async fn list_from_cache() -> Vec<SkillInfo> {
     let path = Path::new(SKILLS_CACHE);
-    if !path.exists() {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         debug!("[SkillsManager] skills.json 不存在，返回空列表");
         return vec![];
     }
-    match std::fs::read_to_string(path) {
+    match tokio::fs::read_to_string(path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(e) => {
             debug!("[SkillsManager] 读取 skills.json 失败: {e}");
@@ -90,8 +90,8 @@ pub async fn refresh_cache() -> Result<Vec<SkillInfo>> {
 
     // 写入缓存（下次心跳直接读）
     if let Ok(json) = serde_json::to_string_pretty(&skills) {
-        let _ = std::fs::create_dir_all("/opt/gnb/cache");
-        let _ = std::fs::write(SKILLS_CACHE, json);
+        let _ = tokio::fs::create_dir_all("/opt/gnb/cache").await;
+        let _ = tokio::fs::write(SKILLS_CACHE, json).await;
         debug!("[SkillsManager] skills.json 已刷新，共 {} 个", skills.len());
     }
 
@@ -189,10 +189,10 @@ pub fn uninstall_command(skill_id: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_list_from_cache_missing_file() {
+    #[tokio::test]
+    async fn test_list_from_cache_missing_file() {
         // skills.json 不存在（开发机）应返回空 Vec 不 panic
-        let skills = list_from_cache();
+        let skills = list_from_cache().await;
         // 可能为空（开发机没有 /opt/gnb/cache/skills.json），但不应 panic
         let _ = skills;
     }

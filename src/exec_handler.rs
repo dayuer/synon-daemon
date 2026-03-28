@@ -169,7 +169,7 @@ pub async fn exec_allowed(command: &str, allowed_extra: &[&str]) -> ExecResult {
                 let is_skill_cmd = ["install", "uninstall", "enable", "disable", "clawhub", "skills"]
                     .iter().any(|kw| cmd.contains(kw));
                 if is_skill_cmd {
-                    crate::heartbeat::invalidate_skills_cache();
+                    crate::heartbeat::invalidate_skills_cache().await;
                 }
             }
 
