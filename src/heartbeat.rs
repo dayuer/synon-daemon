@@ -11,7 +11,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 use tracing::debug;
@@ -94,8 +93,8 @@ pub async fn collect() -> Result<SysInfo> {
 
     // OS / 内核 / 架构 / 负载
     let os         = read_os_release();
-    let kernel     = cmd_output("uname", &["-r"]);
-    let arch       = cmd_output("uname", &["-m"]);
+    let kernel     = cmd_output("uname", &["-r"]).await;
+    let arch       = cmd_output("uname", &["-m"]).await;
     let load       = read_load();
     let cpu_model  = read_cpu_model();
     let cpu_cores  = read_cpu_cores();
@@ -120,7 +119,7 @@ pub async fn collect() -> Result<SysInfo> {
 
     // GNB peer 状态（gnb_ctl -s / -a）
     let map_path       = GNB_MAP_PATH.get().map(String::as_str).unwrap_or("");
-    let (gnb_status, gnb_addresses) = read_gnb_status(map_path);
+    let (gnb_status, gnb_addresses) = read_gnb_status(map_path).await;
 
     // skills 缓存（读 /opt/gnb/cache/skills.json）
     let installed_skills = read_skills_cache().await;
@@ -180,9 +179,9 @@ fn read_mem() -> Result<(u64, u64, f64)> {
     Ok((total, used, pct))
 }
 
-/// 磁盘：调用 df -B1 解析
+/// 磁盘：调用 df -B1 解析（spawn_blocking 包裹同步 fs 操作）
 fn read_disk_percent(path: &str) -> Option<f64> {
-    let output = Command::new("df").args(["-B1", path]).output().ok()?;
+    let output = std::process::Command::new("df").args(["-B1", path]).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line   = stdout.lines().nth(1)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -228,33 +227,37 @@ fn read_cpu_cores() -> u32 {
         .count() as u32
 }
 
-/// 执行短命令，返回 stdout 单行（2s 超时）
-fn cmd_output(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd).args(args)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+/// 执行短命令，返回 stdout 单行（异步，2s 超时）
+async fn cmd_output(cmd: &str, args: &[&str]) -> String {
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new(cmd).args(args).output(),
+    ).await;
+    match result {
+        Ok(Ok(o)) => String::from_utf8(o.stdout)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
-/// GNB 对等状态：调用 gnb_ctl -s 和 -a（带 2s timeout）
-fn read_gnb_status(map_path: &str) -> (String, String) {
+/// GNB 对等状态：调用 gnb_ctl -s 和 -a（异步，2s 超时）
+async fn read_gnb_status(map_path: &str) -> (String, String) {
     if map_path.is_empty() || !std::path::Path::new(map_path).exists() {
         return (String::new(), String::new());
     }
-    let status = Command::new("gnb_ctl")
-        .args(["-b", map_path, "-s"])
-        .output()
+    let run_gnb_ctl = |args: Vec<String>| async move {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::process::Command::new("gnb_ctl").args(&args).output(),
+        ).await
         .ok()
+        .and_then(|r| r.ok())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let addrs = Command::new("gnb_ctl")
-        .args(["-b", map_path, "-a"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+    };
+    let status = run_gnb_ctl(vec!["-b".into(), map_path.into(), "-s".into()]).await;
+    let addrs  = run_gnb_ctl(vec!["-b".into(), map_path.into(), "-a".into()]).await;
     debug!("gnb_ctl status: {} bytes, addrs: {} bytes", status.len(), addrs.len());
     (status, addrs)
 }
@@ -268,17 +271,18 @@ fn read_gnb_status(map_path: &str) -> (String, String) {
 /// 用 `pgrep -a openclaw` 匹配所有前缀为 openclaw 的进程，CPU 求和。
 async fn read_claw_cpu() -> f64 {
     // pgrep -a openclaw：匹配进程名前缀，返回 "pid cmdline" 多行
-    let pids: Vec<u32> = Command::new("pgrep")
+    let pids: Vec<u32> = match tokio::process::Command::new("pgrep")
         .args(["-a", "openclaw"])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
-                .collect()
-        })
-        .unwrap_or_default();
+        .await
+    {
+        Ok(o) => String::from_utf8(o.stdout)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l: &str| l.split_whitespace().next()?.parse::<u32>().ok())
+            .collect(),
+        Err(_) => vec![],
+    };
 
     if pids.is_empty() { return 0.0; }
 

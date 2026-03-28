@@ -8,7 +8,6 @@
 use crate::config::DaemonConfig;
 
 use std::env;
-use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use anyhow::{Result, anyhow};
@@ -139,15 +138,15 @@ async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tok
         .map_err(|e| anyhow!("获取自身路径失败: {e}"))?;
     let tmp_path = self_path.with_extension("new");
 
-    fs::write(&tmp_path, &binary_data)
+    tokio::fs::write(&tmp_path, &binary_data).await
         .map_err(|e| anyhow!("写临时文件失败: {e}"))?;
 
     // 设置可执行权限
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))
+    tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755)).await
         .map_err(|e| anyhow!("设置权限失败: {e}"))?;
 
     // 原子替换
-    fs::rename(&tmp_path, &self_path)
+    tokio::fs::rename(&tmp_path, &self_path).await
         .map_err(|e| anyhow!("替换二进制失败: {e}"))?;
 
     info!("[SelfUpdater] 新版本 v{} 已就位，正在重启...", meta.version);

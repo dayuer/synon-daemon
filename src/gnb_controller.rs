@@ -35,7 +35,7 @@ pub async fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<(
     );
 
     // 3. 发送 SIGHUP 到 gnb 进程
-    match find_gnb_pid() {
+    match find_gnb_pid().await {
         Some(pid) => {
             kill(Pid::from_raw(pid as i32), Signal::SIGHUP)
                 .with_context(|| format!("发送 SIGHUP 到 gnb (PID={pid}) 失败"))?;
@@ -49,19 +49,19 @@ pub async fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<(
     Ok(())
 }
 
-/// 通过 /proc 查找 gnb 进程 PID
-fn find_gnb_pid() -> Option<u32> {
-    let proc_dir = std::fs::read_dir("/proc").ok()?;
-    for entry in proc_dir.flatten() {
-        // 仅处理数字目录（PID）
-        let pid_str = entry.file_name();
-        let pid: u32 = pid_str.to_str()?.parse().ok()?;
-
-        let comm_path = format!("/proc/{pid}/comm");
-        let comm = std::fs::read_to_string(&comm_path).ok()?;
-        if comm.trim() == "gnb" {
-            return Some(pid);
+/// 通过 /proc 查找 gnb 进程 PID（异步，spawn_blocking 防阻塞 reactor）
+async fn find_gnb_pid() -> Option<u32> {
+    tokio::task::spawn_blocking(|| {
+        let proc_dir = std::fs::read_dir("/proc").ok()?;
+        for entry in proc_dir.flatten() {
+            let pid_str = entry.file_name();
+            let pid: u32 = pid_str.to_str()?.parse().ok()?;
+            let comm_path = format!("/proc/{pid}/comm");
+            let comm = std::fs::read_to_string(&comm_path).ok()?;
+            if comm.trim() == "gnb" {
+                return Some(pid);
+            }
         }
-    }
-    None
+        None
+    }).await.ok().flatten()
 }

@@ -22,9 +22,13 @@ cargo build --release
 
 ## 目录结构
 - `src/main.rs`: 守护进程和 Watchdog 启动口。
+- `src/config.rs`: agent.conf + openclaw.json 配置加载器，Console URL 自动转 WSS。
 - `src/console_ws.rs`: Console WebSockets 连接生命周期与事件扇出。
 - `src/heartbeat.rs`: 系统综合信息高频汇聚采集器。
 - `src/task_executor.rs`: 单并发安全排队执行器。
 - `src/exec_handler.rs`: 系统安全命令白名单过滤与隔离执行沙箱。
+- `src/skills_manager.rs`: AI 技能全生命周期管理（安装/卸载/缓存）。
 - `src/gnb_controller.rs` / `src/gnb_monitor.rs`: 跨进程管控核心 `gnb_ctl` 的数据面监控。
 - `src/claw_manager.rs` / `src/claw_proxy.rs`: 开源大模型运维 AI 工具包的对接中介层。
+- `src/watchdog.rs`: GNB + OpenClaw 进程守护与异常重启告警。
+- `src/self_updater.rs`: OTA 自动更新（SHA256 校验 + 原子替换）。
