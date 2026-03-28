@@ -211,10 +211,10 @@ impl ClawProxy {
 
     /// 获取 OpenClaw 状态（通过 CLI 子进程，最可靠）
     pub async fn get_status(&self) -> ClawStatus {
-        use std::process::Command;
-        let output = Command::new("openclaw")
+        let output = tokio::process::Command::new("openclaw")
             .args(["gateway", "status", "--json"])
-            .output();
+            .output()
+            .await;
 
         let running = match output {
             Ok(o) if o.status.success() => {
@@ -226,7 +226,7 @@ impl ClawProxy {
 
         ClawStatus {
             running,
-            version: Self::read_version(),
+            version: Self::read_version().await,
             uptime_ms: None,
         }
     }
@@ -278,9 +278,8 @@ impl ClawProxy {
         }
     }
 
-    fn read_version() -> Option<String> {
-        use std::process::Command;
-        let output = Command::new("openclaw").arg("--version").output().ok()?;
+    async fn read_version() -> Option<String> {
+        let output = tokio::process::Command::new("openclaw").arg("--version").output().await.ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
         // "OpenClaw 2026.3.13 ..." → "2026.3.13"
         text.split_whitespace().nth(1).map(|s| s.to_string())

@@ -24,10 +24,11 @@ pub struct ClawFullStatus {
 }
 
 /// 读取本地安装的 openclaw 版本
-pub fn read_local_version() -> Option<String> {
-    let output = std::process::Command::new("openclaw")
+pub async fn read_local_version() -> Option<String> {
+    let output = tokio::process::Command::new("openclaw")
         .arg("--version")
         .output()
+        .await
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     // "OpenClaw 2026.3.13 ..." → "2026.3.13"
@@ -78,7 +79,7 @@ pub async fn get_pid() -> Option<u32> {
 /// 获取完整状态快照
 pub async fn get_full_status(port: u16) -> ClawFullStatus {
     let running = is_running().await;
-    let version = read_local_version();
+    let version = read_local_version().await;
     let latest_version = fetch_latest_version().await;
     let has_update = match (&version, &latest_version) {
         (Some(v), Some(l)) => v != l,
@@ -132,7 +133,7 @@ pub async fn upgrade(version: Option<&str>) -> Result<String> {
         if let Err(e) = restart().await {
             warn!("[ClawManager] 升级后重启失败: {e}");
         }
-        info!("[ClawManager] 升级完成: {}", read_local_version().unwrap_or_default());
+        info!("[ClawManager] 升级完成: {}", read_local_version().await.unwrap_or_default());
         Ok(stdout)
     } else {
         Err(anyhow::anyhow!("npm install 失败:\nstdout: {stdout}\nstderr: {stderr}"))

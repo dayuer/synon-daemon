@@ -103,8 +103,8 @@ pub async fn collect() -> Result<SysInfo> {
     // 进程检测
     let gnb_running  = is_process_running("gnb");
     let claw_running = is_process_running("openclaw");
-    // OpenClaw 版本（同步读取，无 IO 等待）
-    let claw_version = crate::claw_manager::read_local_version();
+    // OpenClaw 版本（异步读取，不阻塞 executor）
+    let claw_version = crate::claw_manager::read_local_version().await;
     // has_claw_update 不在心跳里做网络查询（避免增加延迟）；Console 主动发 claw_status 时才查
     let has_claw_update = false;
 
