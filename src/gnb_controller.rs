@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::fs;
+use tokio::fs;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -16,16 +16,16 @@ use tracing::{info, warn};
 ///   1. 写入临时文件 address.conf.tmp
 ///   2. 原子重命名为 address.conf
 ///   3. 查找 gnb 进程 PID 并发送 SIGHUP（平滑重载）
-pub fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<()> {
+pub async fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<()> {
     let target = conf_dir.join("address.conf");
     let tmp    = conf_dir.join("address.conf.tmp");
 
     // 1. 写临时文件
-    fs::write(&tmp, address_conf)
+    fs::write(&tmp, address_conf).await
         .with_context(|| format!("写入临时 address.conf 失败: {}", tmp.display()))?;
 
     // 2. 原子重命名
-    fs::rename(&tmp, &target)
+    fs::rename(&tmp, &target).await
         .with_context(|| format!("重命名 address.conf 失败: {} → {}", tmp.display(), target.display()))?;
 
     info!(
@@ -51,14 +51,14 @@ pub fn apply_route_update(conf_dir: &Path, address_conf: &str) -> Result<()> {
 
 /// 通过 /proc 查找 gnb 进程 PID
 fn find_gnb_pid() -> Option<u32> {
-    let proc_dir = fs::read_dir("/proc").ok()?;
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
     for entry in proc_dir.flatten() {
         // 仅处理数字目录（PID）
         let pid_str = entry.file_name();
         let pid: u32 = pid_str.to_str()?.parse().ok()?;
 
         let comm_path = format!("/proc/{pid}/comm");
-        let comm = fs::read_to_string(&comm_path).ok()?;
+        let comm = std::fs::read_to_string(&comm_path).ok()?;
         if comm.trim() == "gnb" {
             return Some(pid);
         }

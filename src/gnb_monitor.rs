@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use std::process::Command;
+use tokio::process::Command;
 
 /// GNB 对等节点状态
 #[derive(Debug, Clone, Serialize)]
@@ -38,13 +38,13 @@ pub struct GnbStatus {
 }
 
 /// 采集 GNB 状态
-pub fn collect(gnb_map_path: &str) -> Result<GnbStatus> {
+pub async fn collect(gnb_map_path: &str) -> Result<GnbStatus> {
     // 优先通过 gnb_ctl -a show 获取地址信息
-    let tun_addr = read_tun_addr();
+    let tun_addr = read_tun_addr().await;
     let tun_ready = tun_addr.is_some();
     let node_id = read_gnb_node_id(gnb_map_path);
 
-    let peers = collect_peers(gnb_map_path).unwrap_or_default();
+    let peers = collect_peers(gnb_map_path).await.unwrap_or_default();
 
     Ok(GnbStatus {
         node_id: node_id.unwrap_or_else(|| "unknown".to_string()),
@@ -55,11 +55,12 @@ pub fn collect(gnb_map_path: &str) -> Result<GnbStatus> {
 }
 
 /// 读取 gnb_tun 接口的 inet 地址
-fn read_tun_addr() -> Option<String> {
+async fn read_tun_addr() -> Option<String> {
     // 读 /proc/net/if_inet6 或用 ip addr 解析
     let output = Command::new("ip")
         .args(["addr", "show", "gnb_tun"])
         .output()
+        .await
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     // 找 "inet X.X.X.X" 行
@@ -88,11 +89,12 @@ fn read_gnb_node_id(gnb_map_path: &str) -> Option<String> {
 }
 
 /// 通过 gnb_ctl 采集对等节点列表
-fn collect_peers(gnb_map_path: &str) -> Result<Vec<GnbPeer>> {
+async fn collect_peers(gnb_map_path: &str) -> Result<Vec<GnbPeer>> {
     // gnb_ctl -a show -m <map> 显示节点表
     let output = Command::new("gnb_ctl")
         .args(["-a", "show", "-m", gnb_map_path])
-        .output();
+        .output()
+        .await;
 
     let Ok(output) = output else {
         // gnb_ctl 未安装或参数不对，返回空

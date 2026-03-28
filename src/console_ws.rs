@@ -118,7 +118,7 @@ async fn connect_and_run(
     let (mut write, mut read) = ws_stream.split();
 
     // 1. 发送 hello 握手帧
-    let gnb_status = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy())
+    let gnb_status = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy()).await
         .ok()
         .map(|s| s.tun_ready)
         .unwrap_or(false);
@@ -349,7 +349,7 @@ async fn handle_server_message(
         // 路由拓扑更新
         "route_update" => {
             if let Some(conf) = msg["addressConf"].as_str() {
-                let ok = gnb_controller::apply_route_update(&config.gnb_conf_dir, conf)
+                let ok = gnb_controller::apply_route_update(&config.gnb_conf_dir, conf).await
                     .map_err(|e| warn!("应用 route_update 失败: {e}"))
                     .is_ok();
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
@@ -661,7 +661,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
 /// 构建心跳 JSON（对齐 node-agent.sh 全量字段，Console ingestFromDaemon 直接消费）
 async fn build_heartbeat(config: &DaemonConfig) -> Result<String> {
     let sys = heartbeat::collect().await?;
-    let gnb = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy()).ok();
+    let gnb = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy()).await.ok();
 
     let msg = json!({
         "type": "heartbeat",
