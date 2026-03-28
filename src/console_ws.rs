@@ -46,9 +46,22 @@ pub async fn run(
     let mut alert_rx = alert_rx;
     let mut retry_secs = RECONNECT_BASE_SECS;
 
+    // OpenClaw 事件订阅：全局单例，独立于 Console 重连生命周期
+    // 避免每次 Console 重连都 spawn 新订阅导致连接风暴
+    let (claw_evt_tx, mut claw_evt_rx) = mpsc::channel::<ClawEvent>(32);
+    let claw_proxy = ClawProxy::new(
+        config.claw_port,
+        config.claw_token.as_deref().unwrap_or(""),
+    );
+    let claw_for_events = claw_proxy.clone_for_events();
+    let claw_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        claw_for_events.subscribe_events(claw_evt_tx, claw_shutdown).await;
+    });
+
     loop {
         info!("正在连接 Console: {}", config.console_url);
-        match connect_and_run(&config, &mut alert_rx).await {
+        match connect_and_run(&config, &mut alert_rx, &claw_proxy, &mut claw_evt_rx).await {
             Ok(()) => {
                 info!("Console 连接正常退出，准备重连...");
             }
@@ -73,6 +86,8 @@ pub async fn run(
 async fn connect_and_run(
     config: &DaemonConfig,
     alert_rx: &mut mpsc::Receiver<WatchdogAlert>,
+    claw_proxy: &ClawProxy,
+    claw_evt_rx: &mut mpsc::Receiver<ClawEvent>,
 ) -> Result<()> {
     // ── 1. 解析 URL → 建立带 SO_KEEPALIVE 的 TCP 连接 ──────────────────────
     let url = Url::parse(&config.console_url)
@@ -123,10 +138,6 @@ async fn connect_and_run(
         .map(|s| s.tun_ready)
         .unwrap_or(false);
 
-    let claw_proxy = ClawProxy::new(
-        config.claw_port,
-        config.claw_token.as_deref().unwrap_or(""),
-    );
     let claw_running = claw_proxy.ping().await;
 
     let hello = json!({
@@ -153,7 +164,6 @@ async fn connect_and_run(
 
     // 3. 重连成功，重置退避计数（通过返回正常退出触发）
     let config = config.clone();
-    let (claw_evt_tx, mut claw_evt_rx) = mpsc::channel::<ClawEvent>(32);
 
     // ── 并发架构：WS write 解耦 + 串行执行器 ──────────────────────────
     // resp_tx：所有需要写 WS 的操作通过此 channel 投递（解耦 write half）
@@ -180,15 +190,6 @@ async fn connect_and_run(
         task_executor::run(task_rx, exec_resp_tx, exec_in_flight).await;
     });
 
-    // 订阅 OpenClaw 实时事件（per-connection token，退出时自动取消旧订阅，防连接泄漏）
-    let claw_cancel = tokio_util::sync::CancellationToken::new();
-    let claw_for_events = claw_proxy.clone_for_events();
-    let claw_cancel_child = claw_cancel.clone();
-    tokio::spawn(async move {
-        claw_for_events.subscribe_events(claw_evt_tx, claw_cancel_child).await;
-    });
-    // drop guard：connect_and_run 退出时（正常/错误/panic）自动 cancel
-    let _claw_guard = claw_cancel.drop_guard();
 
     // 心跳发送 Task（含 systemd watchdog 通知）
     let beat_config = config.clone();
@@ -285,7 +286,7 @@ async fn connect_and_run(
                         );
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
                             if let Err(e) = handle_server_message(
-                                &val, &config, &claw_proxy,
+                                &val, &config, claw_proxy,
                                 &resp_tx, &task_tx, &in_flight,
                             ).await {
                                 warn!("处理 Console 消息失败: {e}");
