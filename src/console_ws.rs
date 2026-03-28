@@ -359,7 +359,7 @@ async fn handle_server_message(
 
         // 密钥滚动更新
         "key_rotate" => {
-            let ok = handle_key_rotate(msg).is_ok();
+            let ok = handle_key_rotate(msg).await.is_ok();
             let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": ok });
             resp_tx.send(Message::Text(resp.to_string())).await.ok();
         }
@@ -368,7 +368,7 @@ async fn handle_server_message(
         "deploy_file" => {
             let path_str = msg["path"].as_str().unwrap_or("");
             let content_b64 = msg["content_b64"].as_str().unwrap_or("");
-            let result = handle_deploy_file(path_str, content_b64);
+            let result = handle_deploy_file(path_str, content_b64).await;
             let resp = json!({
                 "type": "cmd_result",
                 "reqId": req_id,
@@ -527,7 +527,7 @@ async fn dispatch_slow(
 /// - Phase 2 (+ removeOldPubkey): 再删除旧公钥
 ///
 /// 同时更新 synon（主用户）和 root（后备通道）两份 authorized_keys
-fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
+async fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
     // 参数提取与格式校验（防注入）
     let new_key = msg["newPubkey"].as_str()
         .ok_or_else(|| anyhow::anyhow!("缺少 newPubkey"))?;
@@ -538,27 +538,27 @@ fn handle_key_rotate(msg: &serde_json::Value) -> Result<()> {
 
     // synon 用户（Console SSH 主连接用户）
     let synon_path = std::path::PathBuf::from("/home/synon/.ssh/authorized_keys");
-    if synon_path.parent().map(|p| p.exists()).unwrap_or(false) {
-        update_authorized_keys(&synon_path, new_key, remove_old)?;
+    if tokio::fs::try_exists(synon_path.parent().unwrap()).await.unwrap_or(false) {
+        update_authorized_keys(&synon_path, new_key, remove_old).await?;
         info!("密钥轮换: synon authorized_keys 已更新");
     }
 
     // root 用户（紧急后备通道）
     let root_path = std::path::PathBuf::from("/root/.ssh/authorized_keys");
-    update_authorized_keys(&root_path, new_key, remove_old)?;
+    update_authorized_keys(&root_path, new_key, remove_old).await?;
     info!("密钥轮换: root authorized_keys 已更新");
 
     Ok(())
 }
 
 /// 原子更新单个 authorized_keys 文件（追加新公钥 + 可选删除旧公钥）
-fn update_authorized_keys(
+async fn update_authorized_keys(
     auth_keys_path: &std::path::PathBuf,
     new_key: &str,
     remove_old: Option<&str>,
 ) -> Result<()> {
     let tmp_path = auth_keys_path.with_extension("tmp");
-    let existing = std::fs::read_to_string(auth_keys_path).unwrap_or_default();
+    let existing = tokio::fs::read_to_string(auth_keys_path).await.unwrap_or_default();
 
     let mut lines: Vec<&str> = existing.lines().collect();
 
@@ -577,16 +577,16 @@ fn update_authorized_keys(
     let content = format!("{}\n", lines.join("\n"));
 
     // 原子写入 tmp → rename
-    std::fs::write(&tmp_path, &content)
+    tokio::fs::write(&tmp_path, &content).await
         .map_err(|e| anyhow::anyhow!("写 authorized_keys.tmp 失败: {e}"))?;
-    std::fs::rename(&tmp_path, auth_keys_path)
+    tokio::fs::rename(&tmp_path, auth_keys_path).await
         .map_err(|e| anyhow::anyhow!("rename authorized_keys 失败: {e}"))?;
 
     Ok(())
 }
 
 /// 文件分发处理 — base64 解码后原子写入目标路径
-fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
+async fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
     use std::path::Path;
 
     if path_str.is_empty() {
@@ -608,15 +608,17 @@ fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
 
     // 确保父目录存在
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {e}", parent.display()))?;
+        if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {e}", parent.display()))?;
+        }
     }
 
     // 原子写入 tmp → rename
     let tmp = path.with_extension("deploy_tmp");
-    std::fs::write(&tmp, &content)
+    tokio::fs::write(&tmp, &content).await
         .map_err(|e| anyhow::anyhow!("写临时文件失败: {e}"))?;
-    std::fs::rename(&tmp, path)
+    tokio::fs::rename(&tmp, path).await
         .map_err(|e| anyhow::anyhow!("rename 失败: {e}"))?;
 
     info!("[DeployFile] 写入 {} ({} bytes)", path_str, content.len());
