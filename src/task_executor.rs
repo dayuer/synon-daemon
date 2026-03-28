@@ -26,10 +26,18 @@ pub enum TaskMessage {
     SkillInstall {
         req_id: Value,
         skill_id: String,
+        /// 安装源类型（clawhub / openclaw / github / npm / skills.sh / openclaw-bundled）
+        source: String,
+        /// skills.sh / clawhub 的短名（可选）
+        slug: Option<String>,
+        /// github 源仓库名（可选）
+        github_repo: Option<String>,
     },
     SkillUninstall {
         req_id: Value,
         skill_id: String,
+        /// 安装源类型（决定卸载方式）
+        source: String,
     },
     SkillUpdate {
         req_id: Value,
@@ -115,9 +123,14 @@ async fn execute(task: TaskMessage) -> String {
                 "stderr": result.stderr,
             }).to_string()
         }
-        TaskMessage::SkillInstall { req_id, skill_id } => {
-            info!("[TaskExecutor] 安装技能: {skill_id}");
-            let result = skills_manager::install(&skill_id).await;
+        TaskMessage::SkillInstall { req_id, skill_id, source, slug, github_repo } => {
+            info!("[TaskExecutor] 安装技能: {skill_id} (source={source})");
+            let result = skills_manager::install_by_source(
+                &skill_id,
+                &source,
+                slug.as_deref(),
+                github_repo.as_deref(),
+            ).await;
             json!({
                 "type": "cmd_result",
                 "reqId": req_id,
@@ -125,9 +138,9 @@ async fn execute(task: TaskMessage) -> String {
                 "payload": result.unwrap_or_else(|e| e.to_string()),
             }).to_string()
         }
-        TaskMessage::SkillUninstall { req_id, skill_id } => {
-            info!("[TaskExecutor] 卸载技能: {skill_id}");
-            let result = skills_manager::uninstall(&skill_id).await;
+        TaskMessage::SkillUninstall { req_id, skill_id, source } => {
+            info!("[TaskExecutor] 卸载技能: {skill_id} (source={source})");
+            let result = skills_manager::uninstall_by_source(&skill_id, &source).await;
             json!({
                 "type": "cmd_result",
                 "reqId": req_id,

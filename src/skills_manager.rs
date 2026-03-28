@@ -173,16 +173,131 @@ pub async fn update(skill_id: &str) -> Result<String> {
     }
 }
 
-/// 构造安装命令字符串（供 exec_handler 白名单校验，预留 Console 端调用）
-#[allow(dead_code)]
-pub fn install_command(skill_id: &str) -> String {
-    format!("openclaw skills install {skill_id}")
+// ─────────────────────────────────────────────────────────────
+// source-aware 策略层（镜像 Console 的 skill-command.ts 逻辑）
+// ─────────────────────────────────────────────────────────────
+
+/// 按 source 类型决策安装命令并执行（Daemon 端策略自决）
+///
+/// # 参数
+/// - `skill_id`   : 技能 ID（可带版本 `foo@1.0.0`）
+/// - `source`     : 安装源类型（clawhub / openclaw / github / npm / skills.sh / openclaw-bundled）
+/// - `slug`       : skills.sh / clawhub 的短名（可选）
+/// - `github_repo`: github 源仓库名（可选）
+pub async fn install_by_source(
+    skill_id: &str,
+    source: &str,
+    slug: Option<&str>,
+    github_repo: Option<&str>,
+) -> Result<String> {
+    let slug_or_id = slug.unwrap_or(skill_id);
+    let repo = github_repo.unwrap_or(skill_id);
+
+    let command = match source {
+        // 平台内置：仅 enable，不需要下载
+        "openclaw-bundled" => format!("openclaw plugins enable {skill_id}"),
+
+        // clawhub 源：clawhub → openclaw plugins → skills.sh（三级回退）
+        "clawhub" => format!(
+            "(echo '[install] 尝试方式1: clawhub install...' && clawhub install {skill_id}) \
+             || (echo '[install] 尝试方式2: openclaw plugins install...' && openclaw plugins install {skill_id}) \
+             || (echo '[install] 尝试方式3: npx skills add...' && npx -y skills add {slug_or_id})"
+        ),
+
+        // github 源：openclaw github: 前缀安装
+        "github" => format!("openclaw plugins install github:{repo}"),
+
+        // openclaw 源：openclaw plugins → clawhub 回退 + 更新 allowlist
+        "openclaw" => format!(
+            "(echo '[install] 尝试方式1: openclaw plugins install...' && openclaw plugins install {skill_id}) \
+             || (echo '[install] 尝试方式2: clawhub install...' && clawhub install {skill_id}) \
+             && ALLOW=$(openclaw config get plugins.allow 2>/dev/null || echo '[]') \
+             && UPDATED=$(echo \"$ALLOW\" | jq --arg p \"{skill_id}\" 'if type == \"array\" then . + [$p] | unique else [$p] end') \
+             && openclaw config set plugins.allow \"$UPDATED\" --strict-json"
+        ),
+
+        // skills.sh 源：npx skills add → clawhub 回退
+        "skills.sh" => format!(
+            "(echo '[install] 尝试方式1: npx skills add...' && npx -y skills add {slug_or_id}) \
+             || (echo '[install] 尝试方式2: clawhub install...' && clawhub install {skill_id})"
+        ),
+
+        // npm 全局包
+        "npm" => format!(
+            "npm install -g {skill_id} --registry=https://registry.npmmirror.com"
+        ),
+
+        // 未知 source 降级到 openclaw plugins install
+        _ => {
+            info!("[SkillsManager] 未知 source={source}，降级为 openclaw plugins install");
+            format!("openclaw plugins install {skill_id}")
+        }
+    };
+
+    info!("[SkillsManager] install_by_source source={source} skill={skill_id}");
+    let result = exec_by_sh(&command, 120).await;
+    if result.is_ok() {
+        let _ = refresh_cache().await;
+    }
+    result
 }
 
-/// 构造卸载命令字符串（预留 Console 端调用）
-#[allow(dead_code)]
-pub fn uninstall_command(skill_id: &str) -> String {
-    format!("openclaw skills uninstall {skill_id}")
+/// 按 source 类型决策卸载命令并执行
+///
+/// # 参数
+/// - `skill_id`: 技能 ID
+/// - `source`  : 安装源类型（决定卸载方式）
+pub async fn uninstall_by_source(skill_id: &str, source: &str) -> Result<String> {
+    let command = match source {
+        "clawhub" => format!("clawhub uninstall {skill_id}"),
+
+        "github" => format!("openclaw plugins uninstall {skill_id}"),
+
+        "openclaw" => format!(
+            "openclaw plugins uninstall {skill_id} \
+             && ALLOW=$(openclaw config get plugins.allow 2>/dev/null || echo '[]') \
+             && UPDATED=$(echo \"$ALLOW\" | jq --arg p \"{skill_id}\" \
+                'if type == \"array\" then [.[] | select(. != $p)] else [] end') \
+             && openclaw config set plugins.allow \"$UPDATED\" --strict-json"
+        ),
+
+        // openclaw-bundled / 未知 source：disable
+        _ => format!("openclaw plugins disable {skill_id}"),
+    };
+
+    info!("[SkillsManager] uninstall_by_source source={source} skill={skill_id}");
+    let result = exec_by_sh(&command, 60).await;
+    if result.is_ok() {
+        let _ = refresh_cache().await;
+    }
+    result
+}
+
+/// 用 `sh -c` 执行 Shell 命令，支持 `||` 复合链
+///
+/// 仅供 install_by_source / uninstall_by_source 内部调用，不对外暴露。
+/// 超时单位：秒。
+async fn exec_by_sh(command: &str, timeout_secs: u64) -> Result<String> {
+    debug!("[SkillsManager] exec_by_sh: {command}");
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        Command::new("sh").arg("-c").arg(command).output(),
+    )
+    .await
+    .context(format!("命令超时 ({timeout_secs}s)"))?
+    .context("sh -c 执行失败")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        let code = output.status.code().unwrap_or(-1);
+        Err(anyhow::anyhow!(
+            "命令失败 (exit={code}):\nstdout: {stdout}\nstderr: {stderr}"
+        ))
+    }
 }
 
 #[cfg(test)]

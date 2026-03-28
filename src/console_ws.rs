@@ -428,12 +428,15 @@ async fn handle_server_message(
         // 安装技能
         "skill_install" => {
             let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
+            let source    = msg["source"].as_str().unwrap_or("openclaw").to_string();
+            let slug      = msg["slug"].as_str().map(String::from);
+            let github_repo = msg["githubRepo"].as_str().map(String::from);
             if skill_id.is_empty() {
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
                 resp_tx.send(Message::Text(resp.to_string())).await.ok();
             } else {
                 dispatch_slow(
-                    TaskMessage::SkillInstall { req_id, skill_id },
+                    TaskMessage::SkillInstall { req_id, skill_id, source, slug, github_repo },
                     task_tx, resp_tx, in_flight,
                 ).await?;
             }
@@ -442,12 +445,13 @@ async fn handle_server_message(
         // 卸载技能
         "skill_uninstall" => {
             let skill_id = msg["skillId"].as_str().unwrap_or("").to_string();
+            let source    = msg["source"].as_str().unwrap_or("").to_string();
             if skill_id.is_empty() {
                 let resp = json!({ "type": "cmd_result", "reqId": req_id, "ok": false, "payload": "缺少 skillId" });
                 resp_tx.send(Message::Text(resp.to_string())).await.ok();
             } else {
                 dispatch_slow(
-                    TaskMessage::SkillUninstall { req_id, skill_id },
+                    TaskMessage::SkillUninstall { req_id, skill_id, source },
                     task_tx, resp_tx, in_flight,
                 ).await?;
             }
