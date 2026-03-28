@@ -28,24 +28,6 @@ pub struct DaemonConfig {
     pub claw_token: Option<String>,
 }
 
-/// agent.conf 环境文件结构（由 initnode.sh 生成）
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct AgentEnv {
-    #[serde(rename = "CONSOLE_URL")]
-    console_url: Option<String>,
-    #[serde(rename = "TOKEN")]
-    token: Option<String>,
-    #[serde(rename = "NODE_ID")]
-    node_id: Option<String>,
-    #[serde(rename = "GNB_NODE_ID")]
-    gnb_node_id: Option<String>,
-    #[serde(rename = "GNB_MAP_PATH")]
-    gnb_map_path: Option<String>,
-    #[serde(rename = "CLAW_PORT")]
-    claw_port: Option<String>,
-}
-
 /// OpenClaw 配置文件结构
 #[derive(Debug, Deserialize)]
 struct OpenClawConfig {

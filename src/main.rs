@@ -56,7 +56,7 @@ async fn watch_sighup(config_path: String) {
         sighup.recv().await;
         tracing::info!("收到 SIGHUP，重载配置: {config_path}");
         match config::DaemonConfig::load(Some(&config_path)) {
-            Ok(c) => tracing::info!("配置重载成功: Console={} CrawPort={}", c.console_url, c.claw_port),
+            Ok(c) => tracing::info!("配置重载成功: Console={} ClawPort={}", c.console_url, c.claw_port),
             Err(e) => tracing::warn!("配置重载失败: {e}（保持当前配置）"),
         }
     }
