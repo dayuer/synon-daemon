@@ -231,6 +231,14 @@ impl ClawProxy {
         }
     }
 
+    /// 使用 SHA-256 计算 ETag（统一 trim 消除尾部换行差异）
+    fn calc_hash(data: &str) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data.trim());
+        format!("{:x}", hasher.finalize())
+    }
+
     /// 通用 HTTP 调用（供 Console 的 claw_rpc 消息使用）
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         match method {
@@ -254,7 +262,41 @@ impl ClawProxy {
                     .await
                     .context("openclaw config get 失败")?;
                 let text = String::from_utf8_lossy(&output.stdout);
-                Ok(serde_json::from_str(&text).unwrap_or(Value::String(text.to_string())))
+                let data = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text.to_string()));
+                let hash = Self::calc_hash(&text);
+                // 包装为 { data, hash } 格式，前端据此实现 ETag 防脑裂
+                Ok(serde_json::json!({
+                    "data": data,
+                    "hash": hash
+                }))
+            }
+            "config.patch" => {
+                let base_hash = params["baseHash"].as_str().unwrap_or("");
+                // ⚠️ TOCTOU: check 与 write 之间存在竞态窗口，目前无法原子化（需 OpenClaw 原生 CAS）
+                if !base_hash.is_empty() {
+                    let output = tokio::process::Command::new("openclaw")
+                        .args(["config", "get", "--json"])
+                        .output()
+                        .await
+                        .context("openclaw config get 失败")?;
+                    let current_text = String::from_utf8_lossy(&output.stdout);
+                    let current_hash = Self::calc_hash(&current_text);
+
+                    if current_hash != base_hash {
+                        anyhow::bail!("E_CONFLICT")
+                    }
+                }
+
+                // 继续透传到 HTTP API
+                let endpoint = format!("/{}", method.replace('.', "/"));
+                let resp = self.client
+                    .post(format!("{}{}", self.base_url, endpoint))
+                    .bearer_auth(&self.token)
+                    .json(&params)
+                    .send()
+                    .await
+                    .with_context(|| format!("调用 {method} 失败"))?;
+                Ok(resp.json().await.unwrap_or(Value::Null))
             }
             "gateway.restart" => {
                 let _ = tokio::process::Command::new("openclaw")
