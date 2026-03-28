@@ -106,15 +106,34 @@ pub async fn restart() -> Result<()> {
     }
 }
 
+/// 构造回滚包名：有已知版本则固定版本，否则用 latest
+pub fn rollback_pkg(prev_version: Option<&str>) -> String {
+    match prev_version {
+        Some(v) => format!("openclaw@{v}"),
+        None    => "openclaw@latest".to_string(),
+    }
+}
+
+/// 构造升级失败错误消息，含回滚目标版本提示
+pub fn format_upgrade_error(reason: &str, prev_version: Option<&str>) -> String {
+    let rollback_target = rollback_pkg(prev_version);
+    format!("升级失败（{reason}），已回滚到 {rollback_target}")
+}
+
 /// 升级 OpenClaw
 ///
 /// - `version`: None 表示升级到最新版，Some("2026.3.24") 表示指定版本
+/// - 升级后 restart 失败 → 自动回滚到升级前版本并重启
 pub async fn upgrade(version: Option<&str>) -> Result<String> {
     let pkg = match version {
         Some(v) => format!("openclaw@{v}"),
         None    => "openclaw@latest".to_string(),
     };
-    info!("[ClawManager] 升级 OpenClaw: {pkg}");
+
+    // 升级前快照当前版本，供回滚使用
+    let prev_version = read_local_version().await;
+    info!("[ClawManager] 升级 OpenClaw: {pkg}（当前版本: {}）",
+        prev_version.as_deref().unwrap_or("unknown"));
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
@@ -129,15 +148,41 @@ pub async fn upgrade(version: Option<&str>) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    if output.status.success() {
-        if let Err(e) = restart().await {
-            warn!("[ClawManager] 升级后重启失败: {e}");
-        }
-        info!("[ClawManager] 升级完成: {}", read_local_version().await.unwrap_or_default());
-        Ok(stdout)
-    } else {
-        Err(anyhow::anyhow!("npm install 失败:\nstdout: {stdout}\nstderr: {stderr}"))
+    if !output.status.success() {
+        // npm install 本身失败：旧版本仍在磁盘，直接返回错误
+        return Err(anyhow::anyhow!("npm install 失败:\nstdout: {stdout}\nstderr: {stderr}"));
     }
+
+    // npm install 成功，尝试重启
+    if let Err(restart_err) = restart().await {
+        warn!("[ClawManager] 升级后重启失败: {restart_err}，尝试回滚到 {:?}", prev_version);
+
+        // 回滚：重装先前版本
+        let rollback = rollback_pkg(prev_version.as_deref());
+        let rollback_output = tokio::time::timeout(
+            Duration::from_secs(300),
+            Command::new("npm")
+                .args(["install", "-g", &rollback, "--registry=https://registry.npmmirror.com"])
+                .output(),
+        )
+        .await;
+
+        match rollback_output {
+            Ok(Ok(o)) if o.status.success() => {
+                warn!("[ClawManager] 回滚成功，重启中...");
+                let _ = restart().await;
+            }
+            _ => {
+                warn!("[ClawManager] 回滚安装失败，请手动恢复");
+            }
+        }
+
+        return Err(anyhow::anyhow!("{}",
+            format_upgrade_error(&restart_err.to_string(), prev_version.as_deref())));
+    }
+
+    info!("[ClawManager] 升级完成: {}", read_local_version().await.unwrap_or_default());
+    Ok(stdout)
 }
 
 /// 构造 upgrade 命令字符串（供白名单校验，预留 Console 端调用）
@@ -203,5 +248,38 @@ mod tests {
             _ => false,
         };
         assert!(!has_update);
+    }
+
+    // ── Task 1.1: 回滚版本快照测试 ──────────────────────────────
+    #[test]
+    fn test_rollback_pkg_with_known_version() {
+        // 升级前有已知版本 → 回滚包名为具体版本
+        let prev: Option<String> = Some("2026.3.13".into());
+        let pkg = rollback_pkg(prev.as_deref());
+        assert_eq!(pkg, "openclaw@2026.3.13");
+    }
+
+    #[test]
+    fn test_rollback_pkg_without_known_version() {
+        // 升级前版本未知 → 回滚到 latest（总比崩溃强）
+        let prev: Option<String> = None;
+        let pkg = rollback_pkg(prev.as_deref());
+        assert_eq!(pkg, "openclaw@latest");
+    }
+
+    #[test]
+    fn test_upgrade_result_error_contains_rollback_hint() {
+        // upgrade 返回的错误信息应包含回滚信息（集成测试在 CI 中跑真实 npm 无意义，
+        // 这里测试错误消息格式辅助函数）
+        let msg = format_upgrade_error("npm 超时", Some("2026.3.13"));
+        assert!(msg.contains("回滚"));
+        assert!(msg.contains("2026.3.13"));
+    }
+
+    #[test]
+    fn test_upgrade_error_no_prev_version() {
+        let msg = format_upgrade_error("npm 超时", None);
+        assert!(msg.contains("回滚"));
+        assert!(msg.contains("latest"));
     }
 }

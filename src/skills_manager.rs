@@ -101,6 +101,7 @@ pub async fn refresh_cache() -> Result<Vec<SkillInfo>> {
 /// 安装技能
 ///
 /// - `skill_id`: 技能 ID，可带版本号如 `my-skill@1.0.0`
+#[allow(dead_code)]
 pub async fn install(skill_id: &str) -> Result<String> {
     info!("[SkillsManager] 安装技能: {skill_id}");
     let output = tokio::time::timeout(
@@ -126,6 +127,7 @@ pub async fn install(skill_id: &str) -> Result<String> {
 }
 
 /// 卸载技能
+#[allow(dead_code)]
 pub async fn uninstall(skill_id: &str) -> Result<String> {
     info!("[SkillsManager] 卸载技能: {skill_id}");
     let output = tokio::time::timeout(
@@ -298,6 +300,18 @@ async fn exec_by_sh(command: &str, timeout_secs: u64) -> Result<String> {
             "命令失败 (exit={code}):\nstdout: {stdout}\nstderr: {stderr}"
         ))
     }
+}
+
+/// 构造技能安装命令字符串（供白名单校验）
+#[allow(dead_code)]
+pub fn install_command(skill_pkg: &str) -> String {
+    format!("openclaw skills install {skill_pkg}")
+}
+
+/// 构造技能卸载命令字符串（供白名单校验）
+#[allow(dead_code)]
+pub fn uninstall_command(skill_id: &str) -> String {
+    format!("openclaw skills uninstall {skill_id}")
 }
 
 #[cfg(test)]

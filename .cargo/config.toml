@@ -1,0 +1,6 @@
+# musl 静态编译配置 — 生成零 GLIBC 依赖的二进制文件
+# macOS 交叉编译需要 musl-cross: brew install filosottile/musl-cross/musl-cross
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

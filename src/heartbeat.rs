@@ -385,7 +385,7 @@ pub async fn invalidate_skills_cache() {
 /// Console 侧用于 TUN IP 分配时的冲突检测
 async fn read_local_subnets() -> Vec<String> {
     let output = match tokio::process::Command::new("ip")
-        .args(&["-4", "addr", "show", "scope", "global"])
+        .args(["-4", "addr", "show", "scope", "global"])
         .output()
         .await
     {
