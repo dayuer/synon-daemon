@@ -39,7 +39,6 @@ pub async fn run(
 
         check_service(
             "gnb",
-            "systemctl restart gnb",
             &mut gnb_down_since,
             &node_id,
             &alert_tx,
@@ -47,7 +46,6 @@ pub async fn run(
 
         check_service(
             "openclaw-gateway",
-            "systemctl restart openclaw-gateway",
             &mut claw_down_since,
             &node_id,
             &alert_tx,
@@ -55,10 +53,8 @@ pub async fn run(
     }
 }
 
-/// 检查单个服务，超过 30 秒宕机则重启
 async fn check_service(
     name: &str,
-    _restart_cmd: &str,
     down_since: &mut Option<Instant>,
     node_id: &str,
     alert_tx: &tokio::sync::mpsc::Sender<WatchdogAlert>,

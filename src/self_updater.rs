@@ -67,9 +67,14 @@ pub async fn run(config: DaemonConfig, shutdown: tokio_util::sync::CancellationT
 /// 单次检查并更新（可失败）
 async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tokio_util::sync::CancellationToken) -> Result<()> {
     // 1. 查询最新版本元数据
+    let base_url = config.console_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws/daemon", "");
+
     let meta_url = format!(
         "{}/api/mirror/synon-daemon/latest?arch={}&current={}",
-        config.console_url.replace("wss://", "https://").replace("ws://", "http://"),
+        base_url,
         arch_tag(),
         DAEMON_VERSION,
     );
@@ -98,11 +103,7 @@ async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tok
     let download_url = if meta.url.starts_with("http") {
         meta.url.clone()
     } else {
-        format!(
-            "{}/{}",
-            config.console_url.replace("wss://", "https://").replace("ws://", "http://"),
-            meta.url.trim_start_matches('/'),
-        )
+        format!("{}/{}", base_url, meta.url.trim_start_matches('/'))
     };
 
     let binary_data = tokio::time::timeout(
