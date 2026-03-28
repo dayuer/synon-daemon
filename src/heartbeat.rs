@@ -65,6 +65,8 @@ pub struct SysInfo {
     pub claw_cpu_percent: f64,
     /// 已安装 skills（与 /opt/gnb/cache/skills.json 缓存格式一致）
     pub installed_skills: Vec<serde_json::Value>,
+    /// 本地网段 CIDR 列表（排除 lo 和 gnb_tun，用于 Console 侧冲突检测）
+    pub local_subnets: Vec<String>,
 }
 
 /// GNB 地图文件路径（由 config.rs 注入，通过全局 OnceCell 共享）
@@ -124,6 +126,9 @@ pub async fn collect() -> Result<SysInfo> {
     // skills 缓存（读 /opt/gnb/cache/skills.json）
     let installed_skills = read_skills_cache().await;
 
+    // 本地网段探测（用于 Console 侧动态冲突检测）
+    let local_subnets = read_local_subnets().await;
+
     Ok(SysInfo {
         ts, cpu_percent, mem_percent, mem_used_mb, mem_total_mb,
         disk_percent, uptime_sec, hostname,
@@ -132,6 +137,7 @@ pub async fn collect() -> Result<SysInfo> {
         claw_version, has_claw_update,
         gnb_status, gnb_addresses,
         installed_skills,
+        local_subnets,
     })
 }
 
@@ -371,4 +377,63 @@ pub struct SkillEntry {
 pub async fn invalidate_skills_cache() {
     let _ = tokio::fs::remove_file("/opt/gnb/cache/skills.json").await;
     debug!("skills.json 缓存已失效");
+}
+
+/// 采集本地网卡 CIDR 列表（排除 lo、gnb_tun、docker 桥接等虚拟接口）
+///
+/// 输出示例: ["192.168.1.0/24", "10.0.0.0/8"]
+/// Console 侧用于 TUN IP 分配时的冲突检测
+async fn read_local_subnets() -> Vec<String> {
+    let output = match tokio::process::Command::new("ip")
+        .args(&["-4", "addr", "show", "scope", "global"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+
+    let mut subnets = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // 格式: "inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0"
+        if !trimmed.starts_with("inet ") { continue; }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 2 { continue; }
+        let cidr = parts[1]; // e.g. "192.168.1.100/24"
+        // 排除 loopback
+        if cidr.starts_with("127.") { continue; }
+        // 排除 GNB TUN 接口（避免自我冲突）
+        if let Some(iface) = parts.last() {
+            if iface.starts_with("gnb") { continue; }
+        }
+        // 计算网络地址（从 host/prefix 转为 network/prefix）
+        if let Some(network_cidr) = host_cidr_to_network(cidr) {
+            if !subnets.contains(&network_cidr) {
+                subnets.push(network_cidr);
+            }
+        }
+    }
+    subnets
+}
+
+/// 将 host CIDR (如 "192.168.1.100/24") 转为网络 CIDR ("192.168.1.0/24")
+fn host_cidr_to_network(cidr: &str) -> Option<String> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 { return None; }
+    let ip_parts: Vec<u32> = parts[0].split('.').filter_map(|p| p.parse().ok()).collect();
+    let prefix_len: u32 = parts[1].parse().ok()?;
+    if ip_parts.len() != 4 || prefix_len > 32 { return None; }
+
+    let ip_int = (ip_parts[0] << 24) | (ip_parts[1] << 16) | (ip_parts[2] << 8) | ip_parts[3];
+    let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+    let network = ip_int & mask;
+
+    Some(format!("{}.{}.{}.{}/{}",
+        (network >> 24) & 0xff,
+        (network >> 16) & 0xff,
+        (network >> 8) & 0xff,
+        network & 0xff,
+        prefix_len
+    ))
 }
