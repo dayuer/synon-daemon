@@ -123,7 +123,7 @@ async fn handle_daemon_socket(
     state: AppState, 
     node_id: String,
 ) {
-    let (mut sender, mut _receiver) = socket.split();
+    let (mut sender, mut receiver) = socket.split();
     
     // 用 mpsc 代理 websocket send，允许其他线程下发消息
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -144,74 +144,90 @@ async fn handle_daemon_socket(
 
     tracing::info!("Agent [{}] WebSocket 连接就绪", node_id);
     
-    // 主循环，读取 Agent 传上来的信息 (心跳等)
-    while let Some(msg) = _receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if msg_type == "heartbeat" {
-                        if let Err(e) = heartbeat::ingest(&node_id, &json, &state.db_pool).await {
-                            tracing::warn!("Agent {} 心跳处理失败: {}", node_id, e);
-                        }
-                    } else if msg_type == "hello" {
-                        tracing::debug!("Agent {} 发送 hello 握手", node_id);
-                        let ack = serde_json::json!({
-                            "type": "hello-ack",
-                            "ok": true
-                        });
-                        let _ = tx.send(Message::Text(ack.to_string()));
-                    } else if msg_type == "cmd_result" {
-                        tracing::debug!("Agent {} 任务回执: {:?}", node_id, json);
-                        let task_id = json.get("reqId").and_then(|v| v.as_str()).unwrap_or("");
-                        if !task_id.is_empty() {
-                            let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let status_str = if ok { "success" } else { "failed" };
-                            
-                            // 解析回执的 stdout 和 stderr
-                            let payload_str = json.get("payload")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("");
-                                
-                            let stderr_str = if !ok {
-                                json.get("stderr").and_then(|e| e.as_str()).unwrap_or(payload_str)
-                            } else {
-                                ""
-                            };
-                            
-                            let stdout_str = if ok { payload_str } else { "" };
-                            
-                            let db_pool_exec = state.db_pool.clone();
-                            let tid = task_id.to_string();
-                            let so = stdout_str.to_string();
-                            let se = stderr_str.to_string();
-                            
-                            tokio::spawn(async move {
-                                if let Ok(c) = db_pool_exec.get().await {
-                                    let _ = c.interact(move |conn| {
-                                        conn.execute(
-                                            "UPDATE agent_tasks 
-                                             SET status = ?1, 
-                                                 resultStdout = ?2, 
-                                                 resultStderr = ?3, 
-                                                 completedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
-                                             WHERE taskId = ?4", 
-                                            rusqlite::params![status_str, so, se, tid]
-                                        )
-                                    }).await;
-                                }
-                            });
-                        }
-                    }
+    // 定时 Ping（20s 间隔），防止 Agent 端 KeepaliveWatchdog 误判连接死亡
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    ping_interval.tick().await; // 跳过第一次立即触发
+
+    // 主循环：读取 Agent 消息 + 定时发送 Ping
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                let ping_payload = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .to_be_bytes()
+                    .to_vec();
+                if tx.send(Message::Ping(ping_payload)).is_err() {
+                    break;
                 }
             }
-            Ok(Message::Ping(p)) => {
-                let _ = tx.send(Message::Pong(p));
+            msg = receiver.next() => {
+                match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if msg_type == "heartbeat" {
+                                if let Err(e) = heartbeat::ingest(&node_id, &json, &state.db_pool).await {
+                                    tracing::warn!("Agent {} 心跳处理失败: {}", node_id, e);
+                                }
+                            } else if msg_type == "hello" {
+                                tracing::debug!("Agent {} 发送 hello 握手", node_id);
+                                let ack = serde_json::json!({
+                                    "type": "hello-ack",
+                                    "ok": true
+                                });
+                                let _ = tx.send(Message::Text(ack.to_string()));
+                            } else if msg_type == "cmd_result" {
+                                tracing::debug!("Agent {} 任务回执: {:?}", node_id, json);
+                                let task_id = json.get("reqId").and_then(|v| v.as_str()).unwrap_or("");
+                                if !task_id.is_empty() {
+                                    let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let status_str = if ok { "success" } else { "failed" };
+                                    
+                                    let payload_str = json.get("payload")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("");
+                                        
+                                    let stderr_str = if !ok {
+                                        json.get("stderr").and_then(|e| e.as_str()).unwrap_or(payload_str)
+                                    } else {
+                                        ""
+                                    };
+                                    
+                                    let stdout_str = if ok { payload_str } else { "" };
+                                    
+                                    let db_pool_exec = state.db_pool.clone();
+                                    let tid = task_id.to_string();
+                                    let so = stdout_str.to_string();
+                                    let se = stderr_str.to_string();
+                                    
+                                    tokio::spawn(async move {
+                                        if let Ok(c) = db_pool_exec.get().await {
+                                            let _ = c.interact(move |conn| {
+                                                conn.execute(
+                                                    "UPDATE agent_tasks 
+                                                     SET status = ?1, 
+                                                         resultStdout = ?2, 
+                                                         resultStderr = ?3, 
+                                                         completedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
+                                                     WHERE taskId = ?4", 
+                                                    rusqlite::params![status_str, so, se, tid]
+                                                )
+                                            }).await;
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = tx.send(Message::Pong(p));
+                    }
+                    _ => {}
+                }
             }
-            Ok(Message::Close(_)) | Err(_) => {
-                break;
-            }
-            _ => {}
         }
     }
 
