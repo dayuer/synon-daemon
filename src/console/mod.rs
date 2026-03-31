@@ -173,12 +173,36 @@ async fn handle_daemon_socket(
                                     tracing::warn!("Agent {} 心跳处理失败: {}", node_id, e);
                                 }
                             } else if msg_type == "hello" {
-                                tracing::debug!("Agent {} 发送 hello 握手", node_id);
+                                tracing::info!("Agent {} 发送 hello 握手", node_id);
                                 let ack = serde_json::json!({
                                     "type": "hello-ack",
                                     "ok": true
                                 });
                                 let _ = tx.send(Message::Text(ack.to_string()));
+                                
+                                // 自动注册/更新节点到 nodes 表（确保 Admin UI 可见）
+                                let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let gnb_status = json.get("gnbStatus").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                let claw_status = json.get("clawStatus").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                let nid = node_id.clone();
+                                let db = state.db_pool.clone();
+                                tokio::spawn(async move {
+                                    let nid_log = nid.clone();
+                                    if let Ok(c) = db.get().await {
+                                        let _ = c.interact(move |conn| {
+                                            conn.execute(
+                                                "INSERT OR IGNORE INTO nodes (id, name, status, submittedAt) 
+                                                 VALUES (?1, ?1, 'online', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                                                rusqlite::params![nid],
+                                            )?;
+                                            conn.execute(
+                                                "UPDATE nodes SET status = 'online', updatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                                                rusqlite::params![nid],
+                                            )
+                                        }).await;
+                                    }
+                                    tracing::info!("节点 {} 已注册/上线 (v{}, gnb={}, claw={})", nid_log, version, gnb_status, claw_status);
+                                });
                             } else if msg_type == "cmd_result" {
                                 tracing::debug!("Agent {} 任务回执: {:?}", node_id, json);
                                 let task_id = json.get("reqId").and_then(|v| v.as_str()).unwrap_or("");
@@ -231,6 +255,17 @@ async fn handle_daemon_socket(
         }
     }
 
-    // 退出时清除会话
+    // 退出时标记节点离线并清除会话
+    tracing::info!("Agent [{}] 断开连接，标记为 offline", node_id);
+    let nid = node_id.clone();
+    let db = state.db_pool.clone();
+    if let Ok(c) = db.get().await {
+        let _ = c.interact(move |conn| {
+            conn.execute(
+                "UPDATE nodes SET status = 'offline', updatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                rusqlite::params![nid],
+            )
+        }).await;
+    }
     state.session.remove_agent(&node_id).await;
 }
