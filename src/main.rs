@@ -17,14 +17,27 @@ mod heartbeat;
 mod self_updater;
 mod watchdog;
 mod task_executor;
+mod console;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt};
 
+#[derive(clap::Subcommand, Debug, Clone, PartialEq)]
+pub enum Commands {
+    /// 边缘节点模式 (默认行为：连接并接收任务)
+    Agent,
+    /// 中控台后段服务模式 (WebSocket 监听守护与数据库管理)
+    Console,
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "synon-daemon", about = "SynonClaw 节点控制面守护进程")]
+#[command(name = "synon-daemon", version, about = "SynonClaw 控制面守护进程: 可作为 Agent 或 Console 运行")]
 struct Args {
+    /// 指定子命令 (若为空，则默认为 agent)
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// agent.conf 路径（默认: /opt/gnb/bin/agent.conf）
     #[arg(long, default_value = "/opt/gnb/bin/agent.conf")]
     config: String,
@@ -78,7 +91,22 @@ async fn main() {
 
     tracing::info!("synon-daemon v{} 启动", env!("CARGO_PKG_VERSION"));
 
-    // 加载配置
+    let exec_cmd = args.command.unwrap_or(Commands::Agent);
+
+    // 如果是 Console 模式，启动后端服务并直接等待关闭（Console模式不需要 agent.conf）
+    if exec_cmd == Commands::Console {
+        tracing::info!(">>> 进入 Console Backend 模式 <<<");
+        // 全局关闭令牌 — 所有子任务通过此 token 感知优雅关闭
+        let shutdown = CancellationToken::new();
+        let h_console = tokio::spawn(console::run_server(args.config, shutdown.clone()));
+        wait_for_shutdown().await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h_console).await;
+        tracing::info!("Console Backend 已关闭");
+        return;
+    }
+
+    // 只有 Agent 模式才加载配置
     let config = match config::DaemonConfig::load(Some(&args.config)) {
         Ok(c) => c,
         Err(e) => {
@@ -94,6 +122,7 @@ async fn main() {
     // 全局关闭令牌 — 所有子任务通过此 token 感知优雅关闭
     let shutdown = CancellationToken::new();
 
+    tracing::info!(">>> 进入 Agent 模式 <<<");
     // Phase 3: sd_notify(READY=1) — 通知 systemd 服务已就绪
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
 
