@@ -32,6 +32,10 @@ pub async fn ingest(
     
     // 预先提取必须的值，避免将 &Value 移动到闭包中
     let skills_str = frame.get("installedSkills").map(|s| s.to_string()).unwrap_or_else(|| "[]".to_string());
+    
+    // 提取并序列化 sysInfo 为 JSON 字符串存入 nodes 表
+    let sys_info_str = sys.to_string();
+
     let ts = frame.get("ts").and_then(Value::as_i64).unwrap_or_else(|| {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
     });
@@ -39,14 +43,15 @@ pub async fn ingest(
 
     // 在 spawn_blocking 中执行同步 sqlite 操作
     conn.interact(move |conn| -> Result<(), rusqlite::Error> {
-        // 1. 更新节点基础在线状态与配置
+        // 1. 更新节点基础在线状态与配置、以及系统快照(sysInfo)
         conn.execute(
             "UPDATE nodes SET 
                 status = 'online', 
                 updatedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now'),
-                skills = ?1
-             WHERE id = ?2",
-            rusqlite::params![skills_str, node_id_clone],
+                skills = ?1,
+                sysInfo = ?2
+             WHERE id = ?3",
+            rusqlite::params![skills_str, sys_info_str, node_id_clone],
         )?;
 
         // 2. 插入时序 Metrics 数据

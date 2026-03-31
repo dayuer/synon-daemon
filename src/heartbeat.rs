@@ -89,7 +89,7 @@ pub async fn collect() -> Result<SysInfo> {
     // 并行采集各模块（CPU 需要 100ms 间隔，其余同步）
     let cpu_percent = read_cpu_percent().await;
     let (mem_total_mb, mem_used_mb, mem_percent) = read_mem().unwrap_or((0, 0, 0.0));
-    let disk_percent = read_disk_percent("/opt").unwrap_or(0.0);
+    let disk_percent = read_disk_percent("/").unwrap_or(0.0);
     let uptime_sec   = read_uptime().unwrap_or(0);
     let hostname     = fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
 
