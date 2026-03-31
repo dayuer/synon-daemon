@@ -30,11 +30,15 @@ tokio-util = "0.7"
 sd-notify = "0.4"
 
 # --- Console Backend Dependencies ---
-axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["set-header", "cors", "trace"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-deadpool-sqlite = "0.8"
+axum = { version = "0.7", features = ["ws"], optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["set-header", "cors", "trace"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+deadpool-sqlite = { version = "0.8", optional = true }
+
+[features]
+console = ["dep:axum", "dep:tower", "dep:tower-http", "dep:rusqlite", "dep:deadpool-sqlite"]
+default = []
 
 [profile.release]
 opt-level = "z"       # 最小二进制体积

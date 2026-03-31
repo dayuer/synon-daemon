@@ -17,6 +17,7 @@ mod heartbeat;
 mod self_updater;
 mod watchdog;
 mod task_executor;
+#[cfg(feature = "console")]
 mod console;
 
 use clap::Parser;
@@ -27,6 +28,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 pub enum Commands {
     /// 边缘节点模式 (默认行为：连接并接收任务)
     Agent,
+    #[cfg(feature = "console")]
     /// 中控台后段服务模式 (WebSocket 监听守护与数据库管理)
     Console,
 }
@@ -94,6 +96,7 @@ async fn main() {
     let exec_cmd = args.command.unwrap_or(Commands::Agent);
 
     // 如果是 Console 模式，启动后端服务并直接等待关闭（Console模式不需要 agent.conf）
+    #[cfg(feature = "console")]
     if exec_cmd == Commands::Console {
         tracing::info!(">>> 进入 Console Backend 模式 <<<");
         // 全局关闭令牌 — 所有子任务通过此 token 感知优雅关闭
