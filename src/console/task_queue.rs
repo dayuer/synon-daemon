@@ -15,6 +15,8 @@ struct AgentTask {
 /// 后台定期轮询 agent_tasks 表，并将 pending / queued 的任务分发给连接的 Client 节点。
 pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
+    let mut last_dream_at = std::time::Instant::now();
+    let mut is_idle = false;
     
     loop {
         interval.tick().await;
@@ -61,7 +63,24 @@ pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
         };
 
         if tasks.is_empty() {
+            if !is_idle {
+                tracing::debug!("[TaskQueue] 队列已清空，进入闲置期...");
+                is_idle = true;
+            }
+            if last_dream_at.elapsed().as_secs() >= 300 {
+                last_dream_at = std::time::Instant::now();
+                tokio::spawn(async move {
+                    trigger_auto_dream().await;
+                });
+            }
             continue;
+        } else {
+            if is_idle {
+                tracing::debug!("[TaskQueue] 队列有新任务，打断闲置期");
+                is_idle = false;
+            }
+            // 每次有任务时重置计时器，确保只有完全无任务的 5 分钟后才触发
+            last_dream_at = std::time::Instant::now();
         }
 
         // 2. 尝试下发任务
@@ -127,6 +146,39 @@ pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
                     });
                 }
             }
+        }
+    }
+}
+
+/// 触发 Node.js 端的 Auto-Dream 记忆归纳（Sweeper 等清理逻辑）
+async fn trigger_auto_dream() {
+    tracing::info!("[Auto-Dream] 节点空闲超过 5 分钟，触发记忆离线归纳引擎 (Sweeper) 探针...");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+        
+    let nextjs_port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let url = format!("http://127.0.0.1:{}/api/health/sweep", nextjs_port);
+    
+    match client.post(&url)
+        .header("x-agent-mode", "true")
+        .send()
+        .await 
+    {
+        Ok(res) => {
+            if res.status().is_success() {
+                if let Ok(body) = res.text().await {
+                    tracing::info!("[Auto-Dream] 归纳完成: {}", body);
+                } else {
+                    tracing::info!("[Auto-Dream] 归纳完成.");
+                }
+            } else {
+                tracing::warn!("[Auto-Dream] 归纳引擎返回异常状态: {}", res.status());
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[Auto-Dream] 调用 Node.js 探针失败: {}", e);
         }
     }
 }

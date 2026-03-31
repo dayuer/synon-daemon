@@ -90,7 +90,12 @@ async fn connect_and_run(
     claw_evt_rx: &mut mpsc::Receiver<ClawEvent>,
 ) -> Result<()> {
     // ── 1. 解析 URL → 建立带 SO_KEEPALIVE 的 TCP 连接 ──────────────────────
-    let url = Url::parse(&config.console_url)
+    // 在 URL 中附带 nodeId 和 token，供 Console 端的 axum Query 提取
+    let ws_url = format!(
+        "{}?nodeId={}&token={}",
+        config.console_url, config.node_id, config.token,
+    );
+    let url = Url::parse(&ws_url)
         .map_err(|e| anyhow::anyhow!("URL 解析失败: {e}"))?;
     let host = url.host_str().ok_or_else(|| anyhow::anyhow!("URL 缺少 host"))?;
     let port = url.port_or_known_default()
@@ -124,7 +129,7 @@ async fn connect_and_run(
 
     // ── 2. TLS + WebSocket 握手（tokio-tungstenite 接管已连接的 stream）──────
     let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(
-        &config.console_url[..],
+        &ws_url[..],
         tcp,
         None,
         None,
