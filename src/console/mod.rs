@@ -101,9 +101,91 @@ async fn ws_handler(
     ws.on_upgrade(|socket| handle_ui_socket(socket, state))
 }
 
-async fn handle_ui_socket(mut _socket: WebSocket, _state: AppState) {
-    tracing::info!("新 UI WebSocket 连接已建立");
-    // TODO: 实现推送监控变更等逻辑
+async fn handle_ui_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // 用 mpsc 代理 websocket send
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // 注册到 session 层
+    let session_id = state.session.add_ui(tx.clone()).await;
+    tracing::info!("Web UI [{}] WebSocket 连接已建立", session_id);
+
+    // 写入线程
+    let sid_for_tx = session_id.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = sender.send(msg).await {
+                tracing::warn!("Web UI {} 消息写回失败: {}", sid_for_tx, e);
+                break;
+            }
+        }
+    });
+
+    // Ping/Pong 保活（30s 间隔）
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    ping_interval.tick().await; // 跳过第一次
+
+    // 主循环：读取 Web 消息 + 定时 Ping
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                let ping_payload = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .to_be_bytes()
+                    .to_vec();
+                if tx.send(Message::Ping(ping_payload)).is_err() {
+                    break;
+                }
+            }
+            msg = receiver.next() => {
+                match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(text))) => {
+                        // Web 客户端发来的 JSON 消息（如指令下发）
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                            match msg_type {
+                                "ping" => {
+                                    // 应用层 ping → 回 pong
+                                    let pong = serde_json::json!({ "type": "pong", "ts": chrono_ts_ms() });
+                                    let _ = tx.send(Message::Text(pong.to_string()));
+                                }
+                                "auth" => {
+                                    // Bridge 认证消息 → 回 auth_ok
+                                    let ack = serde_json::json!({ "type": "auth_ok" });
+                                    let _ = tx.send(Message::Text(ack.to_string()));
+                                }
+                                _ => {
+                                    // TODO: 可扩展 — 转发 web 指令给指定 agent
+                                    tracing::debug!("Web UI {} 发送: {}", session_id, msg_type);
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = tx.send(Message::Pong(p));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 断开时清理
+    tracing::info!("Web UI [{}] 断开连接", session_id);
+    state.session.remove_ui(&session_id).await;
+}
+
+/// 获取当前毫秒时间戳
+fn chrono_ts_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn ws_daemon_handler(
@@ -172,6 +254,8 @@ async fn handle_daemon_socket(
                                 if let Err(e) = heartbeat::ingest(&node_id, &json, &state.db_pool).await {
                                     tracing::warn!("Agent {} 心跳处理失败: {}", node_id, e);
                                 }
+                                // 广播心跳给所有已连接的 Web UI 客户端
+                                state.session.broadcast_to_ui(&text).await;
                             } else if msg_type == "hello" {
                                 tracing::info!("Agent {} 发送 hello 握手", node_id);
                                 let ack = serde_json::json!({
