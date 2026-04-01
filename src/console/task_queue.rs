@@ -1,4 +1,4 @@
-use axum::extract::ws::Message;
+use rumqttd::local::LinkTx;
 use deadpool_sqlite::Pool;
 use serde_json::json;
 use std::time::Duration;
@@ -12,8 +12,8 @@ struct AgentTask {
     command: String,
 }
 
-/// 后台定期轮询 agent_tasks 表，并将 pending / queued 的任务分发给连接的 Client 节点。
-pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
+/// 后台定期轮询 agent_tasks 表，通过 MQTT 将 queued 任务下发给 Agent。
+pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: LinkTx) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     let mut last_dream_at = std::time::Instant::now();
     let mut is_idle = false;
@@ -21,7 +21,7 @@ pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
     loop {
         interval.tick().await;
 
-        // 1. 获取当前处于 queued 的任务（只查询在线 Node 的任务）
+        // 1. 获取当前处于 queued 的任务
         let pool = db_pool.clone();
         let tasks = match pool.get().await {
             Ok(conn) => {
@@ -79,55 +79,52 @@ pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
                 tracing::debug!("[TaskQueue] 队列有新任务，打断闲置期");
                 is_idle = false;
             }
-            // 每次有任务时重置计时器，确保只有完全无任务的 5 分钟后才触发
+            // 每次有任务时重置计时器
             last_dream_at = std::time::Instant::now();
         }
 
-        // 2. 尝试下发任务
+        // 2. 通过 MQTT 下发任务
         for task in tasks {
-            let agents = session.agents.read().await;
-            if let Some(sender) = agents.get(&task.node_id) {
-                // 构造发给 Agent 的 WebSocket Frame
-                let msg_payload = match task.task_type.as_str() {
-                    "exec_cmd" => json!({
-                        "type": "exec_cmd",
+            // 将任务类型映射到 MQTT topic + payload
+            let (cmd_type, msg_payload) = match task.task_type.as_str() {
+                "exec_cmd" => ("exec", json!({
+                    "reqId": task.task_id,
+                    "command": task.command,
+                    "allowedCmds": ["*"] // TODO: 细粒度白名单安全校验
+                })),
+                "skill_install" => ("skill_install", json!({
+                    "reqId": task.task_id,
+                    "skillId": task.command,
+                })),
+                "skill_uninstall" => ("skill_uninstall", json!({
+                    "reqId": task.task_id,
+                    "skillId": task.command,
+                })),
+                "skill_update" => ("skill_update", json!({
+                    "reqId": task.task_id,
+                    "skillId": task.command,
+                })),
+                "deploy_file" => {
+                    let parsed: serde_json::Value = serde_json::from_str(&task.command).unwrap_or(json!({}));
+                    ("deploy", json!({
                         "reqId": task.task_id,
-                        "command": task.command,
-                        "allowedCmds": ["*"] // TODO: 细粒度白名单安全校验
-                    }),
-                    "skill_install" => json!({
-                        "type": "skill_install",
-                        "reqId": task.task_id,
-                        "skillId": task.command, // task.command 存放的是 skill name
-                    }),
-                    "skill_uninstall" => json!({
-                        "type": "skill_uninstall",
-                        "reqId": task.task_id,
-                        "skillId": task.command,
-                    }),
-                    "skill_update" => json!({
-                        "type": "skill_update",
-                        "reqId": task.task_id,
-                        "skillId": task.command,
-                    }),
-                    "deploy_file" => {
-                        let parsed: serde_json::Value = serde_json::from_str(&task.command).unwrap_or(json!({}));
-                        json!({
-                            "type": "deploy_file",
-                            "reqId": task.task_id,
-                            "path": parsed["path"],
-                            "content_b64": parsed["content_b64"],
-                        })
-                    },
-                    _ => {
-                        tracing::warn!("未知任务类型: {}", task.task_type);
-                        continue;
-                    }
-                };
+                        "path": parsed["path"],
+                        "content_b64": parsed["content_b64"],
+                    }))
+                },
+                _ => {
+                    tracing::warn!("未知任务类型: {}", task.task_type);
+                    continue;
+                }
+            };
 
-                // 执行下发
-                if sender.send(Message::Text(msg_payload.to_string())).is_ok() {
-                    tracing::info!("任务 {} 已下发到 {}", task.task_id, task.node_id);
+            // 通过 MQTT publish 下发指令
+            let topic = format!("synon/cmd/{}/{}", task.node_id, cmd_type);
+            let payload_bytes = msg_payload.to_string().into_bytes();
+            match mqtt_tx.publish(topic.clone(), payload_bytes) {
+                Ok(_) => {
+                    tracing::info!("[TaskQueue] 任务 {} 已通过 MQTT 下发到 {} (topic={})", 
+                        task.task_id, task.node_id, topic);
                     // 标记数据库为 dispatched
                     let p2 = db_pool.clone();
                     let tid = task.task_id.clone();
@@ -144,6 +141,9 @@ pub async fn run_scheduler(db_pool: Pool, session: SessionState) {
                             }).await;
                         }
                     });
+                }
+                Err(e) => {
+                    tracing::warn!("[TaskQueue] MQTT 下发失败 (task={}): {}", task.task_id, e);
                 }
             }
         }

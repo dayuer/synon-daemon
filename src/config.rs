@@ -26,6 +26,8 @@ pub struct DaemonConfig {
     pub claw_port: u16,
     /// OpenClaw 认证 Token（从 openclaw.json 读取）
     pub claw_token: Option<String>,
+    /// MQTT Broker 地址（TUN IP，从 agent.conf MQTT_HOST 读取）
+    pub mqtt_host: Option<String>,
 }
 
 /// OpenClaw 配置文件结构
@@ -102,6 +104,8 @@ impl DaemonConfig {
 
         let gnb_conf_dir = PathBuf::from(format!("/opt/gnb/conf/{gnb_node_id}"));
 
+        let mqtt_host = env.get("MQTT_HOST").cloned();
+
         Ok(DaemonConfig {
             console_url: console_wss,
             token,
@@ -111,6 +115,7 @@ impl DaemonConfig {
             claw_config_path,
             claw_port,
             claw_token,
+            mqtt_host,
         })
     }
 

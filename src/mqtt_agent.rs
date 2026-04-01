@@ -37,16 +37,23 @@ pub async fn run(
     let node_id = &config.node_id;
     let client_id = format!("agent-{}", node_id);
 
-    // ── MQTT URL 解析 ────────────────────────────────────────
-    // 从 console_url (wss://...:3005/ws/daemon) 提取 host 和 port
-    // MQTT Broker 监听在同一主机的 :1883
-    let mqtt_host = extract_host(&config.console_url).unwrap_or("127.0.0.1".to_string());
+    // ── MQTT Broker 地址解析 ──────────────────────────────────
+    // 优先级: MQTT_HOST 环境变量 → agent.conf MQTT_HOST → console_url 提取 host (降级)
+    // 正确做法是使用 Console 的 TUN IP (198.18.0.1)，而非公网域名
+    let mqtt_host = std::env::var("MQTT_HOST")
+        .ok()
+        .or_else(|| config.mqtt_host.clone())
+        .unwrap_or_else(|| {
+            let fallback = extract_host(&config.console_url).unwrap_or("127.0.0.1".to_string());
+            warn!("[MqttAgent] 未配置 MQTT_HOST，降级到 console_url 提取: {}", fallback);
+            fallback
+        });
     let mqtt_port: u16 = std::env::var("MQTT_PORT")
         .unwrap_or_else(|_| "1883".to_string())
         .parse()
         .unwrap_or(1883);
 
-    info!("MQTT 目标: {}:{} (client_id={})", mqtt_host, mqtt_port, client_id);
+    info!("[MqttAgent] MQTT 目标: {}:{} (client_id={})", mqtt_host, mqtt_port, client_id);
 
     // ── 配置 MQTT 连接 ──────────────────────────────────────
     let mut mqttoptions = MqttOptions::new(&client_id, &mqtt_host, mqtt_port);
@@ -92,22 +99,30 @@ pub async fn run(
     // ── 心跳发送循环 ────────────────────────────────────────
     let beat_client = client.clone();
     let beat_config = config.clone();
+    let beat_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         loop {
-            ticker.tick().await;
-            // systemd watchdog 心跳
-            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
-            match build_heartbeat(&beat_config).await {
-                Ok(payload) => {
-                    let topic = format!("synon/agent/{}/heartbeat", beat_config.node_id);
-                    if let Err(e) = beat_client.publish(
-                        topic, QoS::AtMostOnce, false, payload.into_bytes()
-                    ).await {
-                        warn!("[MqttAgent] 心跳发布失败: {}", e);
+            tokio::select! {
+                _ = beat_shutdown.cancelled() => {
+                    tracing::debug!("[MqttAgent] 心跳循环收到关闭信号");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    // systemd watchdog 心跳
+                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                    match build_heartbeat(&beat_config).await {
+                        Ok(payload) => {
+                            let topic = format!("synon/agent/{}/heartbeat", beat_config.node_id);
+                            if let Err(e) = beat_client.publish(
+                                topic, QoS::AtMostOnce, false, payload.into_bytes()
+                            ).await {
+                                warn!("[MqttAgent] 心跳发布失败: {}", e);
+                            }
+                        }
+                        Err(e) => warn!("[MqttAgent] 心跳采集失败: {}", e),
                     }
                 }
-                Err(e) => warn!("[MqttAgent] 心跳采集失败: {}", e),
             }
         }
     });
@@ -118,12 +133,14 @@ pub async fn run(
         tokio::select! {
             _ = shutdown.cancelled() => {
                 info!("[MqttAgent] 收到关闭信号");
-                // 优雅离线：发布 offline (Retain)
-                let _ = client.publish(
-                    format!("synon/agent/{}/status", node_id),
-                    QoS::AtLeastOnce, true, "offline"
-                ).await;
-                let _ = client.disconnect().await;
+                // 优雅离线：发布 offline (Retain)，1s 超时防止阻塞
+                let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                    let _ = client.publish(
+                        format!("synon/agent/{}/status", node_id),
+                        QoS::AtLeastOnce, true, "offline"
+                    ).await;
+                    let _ = client.disconnect().await;
+                }).await;
                 break;
             }
 

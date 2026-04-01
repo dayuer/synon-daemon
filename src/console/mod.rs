@@ -60,7 +60,7 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
         .with_state(state);
 
     // 拉起 MQTT Broker + 内部消费者桥接
-    let (mut broker, link_tx, link_rx) = mqtt_broker::create_broker();
+    let (mut broker, link_tx, link_rx, dispatcher_tx) = mqtt_broker::create_broker();
     // Broker 阻塞式启动（独立 OS 线程）
     let mqtt_bind = std::env::var("MQTT_BIND_ADDR").unwrap_or_else(|_| "198.18.0.1".to_string());
     let mqtt_port = std::env::var("MQTT_BIND_PORT").unwrap_or_else(|_| "1883".to_string());
@@ -81,11 +81,11 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
         ).await;
     });
 
-    // 拉起离线任务排队引擎
+    // 拉起离线任务排队引擎（使用 MQTT dispatcher link 下发指令）
     let db_pool_for_tq = pool.clone();
     let session_for_tq = session_state.clone();
     tokio::spawn(async move {
-        task_queue::run_scheduler(db_pool_for_tq, session_for_tq).await;
+        task_queue::run_scheduler(db_pool_for_tq, session_for_tq, dispatcher_tx).await;
     });
 
     let port: u16 = std::env::var("CONSOLE_BACKEND_PORT")

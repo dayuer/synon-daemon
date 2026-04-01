@@ -79,14 +79,22 @@ pub fn build_broker_config() -> Config {
     }
 }
 
-/// 创建 Broker 实例和 local link（在 mod.rs 中调用）
-pub fn create_broker() -> (Broker, LinkTx, LinkRx) {
+/// 创建 Broker 实例和两组 local link（在 mod.rs 中调用）
+///
+/// 返回:
+///   - broker: Broker 实例（需在独立线程中 start()）
+///   - consumer link (tx, rx): 用于 mqtt_broker::run_consumer_bridge 订阅消费
+///   - dispatcher link_tx: 用于 task_queue 发布下行指令（只需 tx，不需要 rx）
+pub fn create_broker() -> (Broker, LinkTx, LinkRx, LinkTx) {
     let config = build_broker_config();
     let broker = Broker::new(config);
-    let (link_tx, link_rx) = broker
+    let (consumer_tx, consumer_rx) = broker
         .link("console-core")
-        .expect("创建 MQTT local link 不应失败（Broker 刚创建）");
-    (broker, link_tx, link_rx)
+        .expect("创建 consumer link 不应失败");
+    let (dispatcher_tx, _dispatcher_rx) = broker
+        .link("console-dispatcher")
+        .expect("创建 dispatcher link 不应失败");
+    (broker, consumer_tx, consumer_rx, dispatcher_tx)
 }
 
 /// 独立消费者线程：从 rumqttd local link 读取消息，通过 mpsc 转发到 tokio 异步世界
