@@ -62,8 +62,10 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
     // 拉起 MQTT Broker + 内部消费者桥接
     let (mut broker, link_tx, link_rx) = mqtt_broker::create_broker();
     // Broker 阻塞式启动（独立 OS 线程）
+    let mqtt_bind = std::env::var("MQTT_BIND_ADDR").unwrap_or_else(|_| "198.18.0.1".to_string());
+    let mqtt_port = std::env::var("MQTT_BIND_PORT").unwrap_or_else(|_| "1883".to_string());
     std::thread::spawn(move || {
-        tracing::info!("MQTT Broker 启动，监听 0.0.0.0:1883");
+        tracing::info!("MQTT Broker 启动，监听 {}:{}", mqtt_bind, mqtt_port);
         if let Err(e) = broker.start() {
             tracing::error!("MQTT Broker 异常退出: {}", e);
         }

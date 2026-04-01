@@ -21,6 +21,10 @@ use crate::console::heartbeat as console_heartbeat;
 use crate::console::session::SessionState;
 
 /// 编程式构建 Broker 配置（不依赖外部 TOML 文件）
+///
+/// 默认绑定 GNB TUN 地址 198.18.0.1:1883，可通过环境变量覆盖：
+///   MQTT_BIND_ADDR=0.0.0.0  （开发环境使用）
+///   MQTT_BIND_PORT=1883
 pub fn build_broker_config() -> Config {
     let connection_settings = ConnectionSettings {
         connection_timeout_ms: 60_000,
@@ -31,12 +35,22 @@ pub fn build_broker_config() -> Config {
         dynamic_filters: true,
     };
 
+    // 默认绑定 TUN 接口（198.18.0.1），仅通过 GNB P2P 隧道可达
+    let bind_addr: std::net::Ipv4Addr = std::env::var("MQTT_BIND_ADDR")
+        .unwrap_or_else(|_| "198.18.0.1".to_string())
+        .parse()
+        .unwrap_or(std::net::Ipv4Addr::new(198, 18, 0, 1));
+    let bind_port: u16 = std::env::var("MQTT_BIND_PORT")
+        .unwrap_or_else(|_| "1883".to_string())
+        .parse()
+        .unwrap_or(1883);
+
     let mut v4_listeners = HashMap::new();
     v4_listeners.insert(
         "mqtt-tcp".to_string(),
         ServerSettings {
             name: "mqtt-tcp".to_string(),
-            listen: ([0, 0, 0, 0], 1883).into(),
+            listen: std::net::SocketAddr::new(std::net::IpAddr::V4(bind_addr), bind_port),
             next_connection_delay_ms: 1,
             connections: connection_settings,
             tls: None,
