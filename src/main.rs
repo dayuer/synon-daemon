@@ -7,6 +7,7 @@
 
 mod config;
 mod console_ws;
+mod mqtt_agent;
 mod claw_proxy;
 mod claw_manager;
 mod skills_manager;
@@ -179,11 +180,20 @@ async fn main() {
         watch_sighup(config_path).await;
     });
 
-    // Console WSS 连接（含自动重连）— 主任务
+    // 通信层选择：USE_MQTT=1 时使用 MQTT，否则使用旧 WSS
+    let use_mqtt = std::env::var("USE_MQTT").unwrap_or_default() == "1";
     let ws_token = shutdown.clone();
-    let h_ws = tokio::spawn(async move {
-        console_ws::run(config, alert_rx, ws_token).await;
-    });
+    let h_ws = if use_mqtt {
+        tracing::info!(">>> 使用 MQTT 通信层 <<<");
+        tokio::spawn(async move {
+            mqtt_agent::run(config, alert_rx, ws_token).await;
+        })
+    } else {
+        tracing::info!(">>> 使用旧 WSS 通信层 <<<");
+        tokio::spawn(async move {
+            console_ws::run(config, alert_rx, ws_token).await;
+        })
+    };
 
     // 等待关闭信号
     wait_for_shutdown().await;

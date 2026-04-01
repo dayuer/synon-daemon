@@ -14,6 +14,7 @@ pub mod db;
 pub mod session;
 pub mod heartbeat;
 pub mod task_queue;
+pub mod mqtt_broker;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +58,26 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
         .route("/ws", get(ws_handler))
         .route("/ws/daemon", get(ws_daemon_handler))
         .with_state(state);
+
+    // 拉起 MQTT Broker + 内部消费者桥接
+    let (mut broker, link_tx, link_rx) = mqtt_broker::create_broker();
+    // Broker 阻塞式启动（独立 OS 线程）
+    std::thread::spawn(move || {
+        tracing::info!("MQTT Broker 启动，监听 0.0.0.0:1883");
+        if let Err(e) = broker.start() {
+            tracing::error!("MQTT Broker 异常退出: {}", e);
+        }
+    });
+    // 消费者桥接（tokio 异步任务）
+    let consumer_db = pool.clone();
+    let consumer_session = session_state.clone();
+    let consumer_shutdown = shutdown_token.clone();
+    tokio::spawn(async move {
+        mqtt_broker::run_consumer_bridge(
+            consumer_db, consumer_session, consumer_shutdown,
+            link_tx, link_rx,
+        ).await;
+    });
 
     // 拉起离线任务排队引擎
     let db_pool_for_tq = pool.clone();

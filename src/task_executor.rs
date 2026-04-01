@@ -108,7 +108,7 @@ pub async fn run(
 }
 
 /// 执行单个任务，返回 JSON 响应字符串
-async fn execute(task: TaskMessage) -> String {
+pub async fn execute(task: TaskMessage) -> String {
     match task {
         TaskMessage::ExecCmd { req_id, command, allowed_extra } => {
             info!("[TaskExecutor] 执行命令: {command}");

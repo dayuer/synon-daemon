@@ -29,15 +29,19 @@ libc = "0.2"
 tokio-util = "0.7"
 sd-notify = "0.4"
 
+# --- MQTT 通信层 ---
+rumqttc = "0.24"                                                          # Agent MQTT 客户端
+
 # --- Console Backend Dependencies ---
 axum = { version = "0.7", features = ["ws"], optional = true }
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["set-header", "cors", "trace"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 deadpool-sqlite = { version = "0.8", optional = true }
+rumqttd = { version = "0.19", optional = true }                            # Console 嵌入式 MQTT Broker
 
 [features]
-console = ["dep:axum", "dep:tower", "dep:tower-http", "dep:rusqlite", "dep:deadpool-sqlite"]
+console = ["dep:axum", "dep:tower", "dep:tower-http", "dep:rusqlite", "dep:deadpool-sqlite", "dep:rumqttd"]
 default = []
 
 [profile.release]
