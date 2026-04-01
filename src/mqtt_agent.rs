@@ -197,11 +197,17 @@ pub async fn run(
                     Ok(Event::Incoming(Incoming::Publish(publish))) => {
                         let topic = publish.topic.clone();
                         let payload = publish.payload.to_vec();
-                        if let Err(e) = handle_incoming_command(
-                            &topic, &payload, &config, &claw_proxy,
-                            &client, &task_tx, &in_flight,
-                        ).await {
-                            warn!("[MqttAgent] 处理指令失败 ({}): {}", topic, e);
+                        if topic.starts_with("synon/cmd/") {
+                            if let Err(e) = handle_incoming_command(
+                                &topic, &payload, &config, &claw_proxy,
+                                &client, &task_tx, &in_flight,
+                            ).await {
+                                warn!("[MqttAgent] 处理指令失败 ({}): {}", topic, e);
+                            }
+                        } else if topic.starts_with("synon/sys/") {
+                            handle_sys_message(&topic, &payload).await;
+                        } else {
+                            debug!("[MqttAgent] 忽略未知 topic: {}", topic);
                         }
                     }
 
@@ -333,9 +339,105 @@ async fn handle_incoming_command(
                 task_tx, client, config, in_flight).await?;
         }
 
+        // ═══ 文件分发（就地执行）═══
+        "deploy" => {
+            let path_str = msg["path"].as_str().unwrap_or("");
+            let content_b64 = msg["content_b64"].as_str().unwrap_or("");
+            let result = handle_deploy_file(path_str, content_b64).await;
+            publish_result(client, config, &req_id, result.is_ok(),
+                json!(result.err().map(|e| e.to_string()).unwrap_or_default())).await;
+        }
+
         unknown => debug!("[MqttAgent] 未知指令类型: {}", unknown),
     }
     Ok(())
+}
+
+/// 处理 synon/sys/config/# 等非指令类 MQTT 消息
+async fn handle_sys_message(topic: &str, payload: &[u8]) {
+    let parts: Vec<&str> = topic.split('/').collect();
+    if parts.len() >= 3 && parts[0] == "synon" && parts[1] == "sys" {
+        let config_key = parts[2..].join("/");
+        if let Ok(json_str) = std::str::from_utf8(payload) {
+            info!("[MqttAgent] 收到系统配置: {} = {}", config_key,
+                &json_str[..json_str.len().min(200)]);
+            // TODO: 按 config_key 分发具体配置更新逻辑
+        }
+    }
+}
+
+/// 原子文件分发：base64 解码 → 安全校验 → 写入
+async fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
+    use std::path::Path;
+
+    if path_str.is_empty() {
+        return Err(anyhow::anyhow!("path 为空"));
+    }
+    let path = Path::new(path_str);
+
+    // 安全校验：必须绝对路径 + 不含路径穿越
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!("path 必须是绝对路径: {}", path_str));
+    }
+    if path_str.contains("..") {
+        return Err(anyhow::anyhow!("path 不允许包含 '..': {}", path_str));
+    }
+
+    // base64 解码
+    let content = base64_decode(content_b64)?;
+
+    // 确保父目录存在
+    if let Some(parent) = path.parent() {
+        if !tokio::fs::try_exists(parent).await.unwrap_or(false) {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| anyhow::anyhow!("创建目录失败 {}: {}", parent.display(), e))?;
+        }
+    }
+
+    // 原子写入 tmp → rename
+    let tmp = path.with_extension("deploy_tmp");
+    tokio::fs::write(&tmp, &content).await
+        .map_err(|e| anyhow::anyhow!("写临时文件失败: {}", e))?;
+    tokio::fs::rename(&tmp, path).await
+        .map_err(|e| anyhow::anyhow!("rename 失败: {}", e))?;
+
+    info!("[DeployFile] 写入 {} ({} bytes)", path_str, content.len());
+    Ok(())
+}
+
+/// base64 解码（标准字母表，padding 可选）
+fn base64_decode(input: &str) -> Result<Vec<u8>> {
+    let input = input.trim();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in alphabet.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let input: Vec<u8> = input.bytes().filter(|&b| b != b'=').collect();
+    let mut i = 0;
+    while i < input.len() {
+        let rem = input.len() - i;
+        let a = table[input[i] as usize];
+        if a == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+        if rem >= 2 {
+            let b = table[input[i+1] as usize];
+            if b == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+            out.push((a << 2) | (b >> 4));
+            if rem >= 3 {
+                let c = table[input[i+2] as usize];
+                if c == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+                out.push((b << 4) | (c >> 2));
+                if rem >= 4 {
+                    let d = table[input[i+3] as usize];
+                    if d == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
+                    out.push((c << 6) | d);
+                    i += 4;
+                } else { i += 3; }
+            } else { i += 2; }
+        } else { i += 1; }
+    }
+    Ok(out)
 }
 
 /// 发布任务结果到 MQTT
