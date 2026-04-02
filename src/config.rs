@@ -11,14 +11,14 @@ use std::path::PathBuf;
 pub struct DaemonConfig {
     /// Console WSS 地址，例如 wss://api.synonclaw.com/ws/daemon
     pub console_url: String,
-    /// 节点 API Token（注册时颁发）
-    pub token: String,
     /// 节点 ID（平台分配）
     pub node_id: String,
     /// GNB 节点配置目录
     pub gnb_conf_dir: PathBuf,
     /// GNB mmap map 路径（用于 gnb_ctl）
     pub gnb_map_path: PathBuf,
+    /// GNB Ed25519 密钥目录 (v2: 用于 MQTT 签名认证)
+    pub gnb_key_dir: Option<PathBuf>,
     /// OpenClaw 配置文件路径
 #[allow(dead_code)]
     pub claw_config_path: PathBuf,
@@ -74,13 +74,20 @@ impl DaemonConfig {
         let console_url = env.get("CONSOLE_URL")
             .cloned()
             .context("agent.conf 缺少 CONSOLE_URL")?;
-        let token = env.get("TOKEN")
-            .cloned()
-            .context("agent.conf 缺少 TOKEN")?;
         let node_id = env.get("NODE_ID")
             .cloned()
             .context("agent.conf 缺少 NODE_ID")?;
         let gnb_node_id = env.get("GNB_NODE_ID").cloned().unwrap_or_default();
+
+        // v2: GNB Ed25519 密钥目录 (用于 MQTT 签名认证)
+        let gnb_key_dir = env.get("GNB_KEY_DIR").map(PathBuf::from)
+            .or_else(|| {
+                if !gnb_node_id.is_empty() {
+                    Some(PathBuf::from(format!("/opt/gnb/conf/{gnb_node_id}/security")))
+                } else {
+                    None
+                }
+            });
         let gnb_map_path = env.get("GNB_MAP_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("/opt/gnb/conf/{gnb_node_id}/gnb.map")));
@@ -108,10 +115,10 @@ impl DaemonConfig {
 
         Ok(DaemonConfig {
             console_url: console_wss,
-            token,
             node_id,
             gnb_conf_dir,
             gnb_map_path,
+            gnb_key_dir,
             claw_config_path,
             claw_port,
             claw_token,

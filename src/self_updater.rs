@@ -82,7 +82,6 @@ async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tok
 
     let resp = client
         .get(&meta_url)
-        .bearer_auth(&config.token)
         .send()
         .await?;
 
@@ -110,7 +109,6 @@ async fn check_and_update(config: &DaemonConfig, client: &Client, shutdown: &tok
         async {
             client
                 .get(&download_url)
-                .bearer_auth(&config.token)
                 .send()
                 .await?
                 .bytes()

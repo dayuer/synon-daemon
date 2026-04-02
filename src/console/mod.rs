@@ -15,6 +15,7 @@ pub mod session;
 pub mod heartbeat;
 pub mod task_queue;
 pub mod mqtt_broker;
+pub mod auth;
 
 #[derive(Clone)]
 pub struct AppState {

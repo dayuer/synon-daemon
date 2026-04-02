@@ -22,6 +22,8 @@ use crate::watchdog::WatchdogAlert;
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, LastWill};
 use serde_json::{json, Value};
+use sha2::Sha256;
+use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -67,8 +69,25 @@ pub async fn run(
         true, // retain
     );
     mqttoptions.set_last_will(lwt);
-    // 认证：使用 node_id/token 作为 username/password
-    mqttoptions.set_credentials(&config.node_id, &config.token);
+
+    // Ed25519 签名认证 (HMAC-SHA256 以 GNB 私钥作为 key)
+    // 格式: username=nodeId, password="timestamp:hmac_base64"
+    let mqtt_password = if let Some(ref key_dir) = config.gnb_key_dir {
+        match build_signed_password(&config.node_id, key_dir) {
+            Ok(pw) => {
+                info!("[MqttAgent] 使用 Ed25519 签名认证 (GNB 密钥)");
+                pw
+            }
+            Err(e) => {
+                warn!("[MqttAgent] 签名构建失败 ({}), MQTT 连接可能被拒绝", e);
+                String::new()
+            }
+        }
+    } else {
+        warn!("[MqttAgent] 未配置 GNB_KEY_DIR — MQTT 连接可能被拒绝");
+        String::new()
+    };
+    mqttoptions.set_credentials(&config.node_id, &mqtt_password);
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 64);
 
@@ -540,4 +559,41 @@ fn ts_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// v2: 构建 Ed25519 签名密码
+///
+/// 格式: "timestamp:hmac_base64"
+///   - message = "{node_id}|{timestamp}"
+///   - key = 文件 {gnb_key_dir}/ed25519.private 的前 32 字节
+///   - signature = HMAC-SHA256(key, message) → base64
+///
+/// Console 端使用同一私钥的对应公钥验签（HMAC-SHA256 对称方案作为过渡，
+/// 后续迁移到真正的 Ed25519 非对称签名需引入 ed25519-dalek）。
+fn build_signed_password(node_id: &str, gnb_key_dir: &Path) -> Result<String> {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let key_path = gnb_key_dir.join("ed25519.private");
+    let key_bytes = std::fs::read(&key_path)
+        .map_err(|e| anyhow::anyhow!("读取 GNB 私钥失败 ({}): {}", key_path.display(), e))?;
+
+    // 取前 32 字节作为 HMAC key（GNB Ed25519 私钥至少 64 字节）
+    if key_bytes.len() < 32 {
+        anyhow::bail!("GNB 私钥文件过短 ({} bytes)", key_bytes.len());
+    }
+    let hmac_key = &key_bytes[..32];
+
+    let timestamp = ts_ms().to_string();
+    let message = format!("{}|{}", node_id, timestamp);
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
+        .map_err(|e| anyhow::anyhow!("HMAC 初始化失败: {}", e))?;
+    Mac::update(&mut mac, message.as_bytes());
+    let signature = mac.finalize().into_bytes();
+
+    use base64::Engine;
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+
+    Ok(format!("{}:{}", timestamp, sig_b64))
 }
