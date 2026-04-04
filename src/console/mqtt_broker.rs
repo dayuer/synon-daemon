@@ -238,6 +238,21 @@ async fn handle_mqtt_message(
             "status": status,
         });
         session.broadcast_to_ui(&ui_msg.to_string()).await;
+
+        // LWT 离线时额外广播专用事件 — 供 Node.js WsBridge 触发 AutoHeal 快速路径
+        if status == "offline" {
+            let lwt_msg = serde_json::json!({
+                "type": "lwt_offline",
+                "nodeId": node_id,
+                "source": "mqtt_lwt",
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            });
+            session.broadcast_to_ui(&lwt_msg.to_string()).await;
+            tracing::warn!("[MqttBroker] LWT 离线事件已广播: {}", node_id);
+        }
         return;
     }
 

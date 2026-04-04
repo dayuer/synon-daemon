@@ -59,7 +59,7 @@ pub async fn run(
 
     // ── 配置 MQTT 连接 ──────────────────────────────────────
     let mut mqttoptions = MqttOptions::new(&client_id, &mqtt_host, mqtt_port);
-    mqttoptions.set_keep_alive(Duration::from_secs(30));
+    mqttoptions.set_keep_alive(Duration::from_secs(15));
     mqttoptions.set_clean_session(true);
     // LWT 遗嘱：TCP 异常断开时 Broker 自动发布 "offline"
     let lwt = LastWill::new(
