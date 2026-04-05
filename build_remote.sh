@@ -73,8 +73,12 @@ if [ "$DO_DEPLOY" = "true" ]; then
       cp $REMOTE_PROJECT_DIR/target/$TARGET/release/$BINARY_NAME $MIRROR_DIR/synon-daemon-x86_64-musl
       # 向下兼容旧节点（已部署的 initnode.sh 可能用 -linux-gnu 名字）
       cp $MIRROR_DIR/synon-daemon-x86_64-musl $MIRROR_DIR/synon-daemon-x86_64-linux-gnu
-      # 写入版本号（Cargo.toml version）
-      grep '^version' $REMOTE_PROJECT_DIR/Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/' > $MIRROR_DIR/.version
+      # 写入 BUILD_VERSION（编译时间戳版本号，格式: YYYYMMDD.HHmmss）
+      # 从编译好的二进制 --version 输出中提取 build 版本号
+      BUILD_VER=$($REMOTE_PROJECT_DIR/target/$TARGET/release/$BINARY_NAME --version 2>/dev/null | sed -n 's/.*build \([0-9.]*\).*/\1/p')
+      [ -z "\\$BUILD_VER" ] && BUILD_VER=$(date '+%Y%m%d.%H%M%S')
+      echo \\$BUILD_VER > $MIRROR_DIR/.version
+      echo "      版本号: \\$BUILD_VER"
       # 生成 SHA256（供 self_updater 校验）
       sha256sum $MIRROR_DIR/synon-daemon-x86_64-musl | awk '{print \$1}' > $MIRROR_DIR/synon-daemon-x86_64-musl.sha256
       echo '      ✅ 已部署到镜像目录'

@@ -34,7 +34,11 @@ pub enum Commands {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "synon-daemon", version, about = "SynonClaw 控制面守护进程: 可作为 Agent 或 Console 运行")]
+#[command(
+    name = "synon-daemon",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (build ", env!("BUILD_VERSION"), ")"),
+    about = "SynonClaw 控制面守护进程: 可作为 Agent 或 Console 运行"
+)]
 struct Args {
     /// 指定子命令 (若为空，则默认为 agent)
     #[command(subcommand)]
@@ -91,7 +95,7 @@ async fn main() {
         .compact()
         .init();
 
-    tracing::info!("synon-daemon v{} 启动", env!("CARGO_PKG_VERSION"));
+    tracing::info!("synon-daemon v{} (build {}) 启动", env!("CARGO_PKG_VERSION"), env!("BUILD_VERSION"));
 
     let exec_cmd = args.command.unwrap_or(Commands::Agent);
 

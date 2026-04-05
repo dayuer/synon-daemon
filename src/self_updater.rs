@@ -17,7 +17,8 @@ use sha2::{Sha256, Digest};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 编译时间戳版本号（格式: YYYYMMDD.HHmmss），由 build.rs 注入
+const DAEMON_VERSION: &str = env!("BUILD_VERSION");
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60; // 24 小时
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 
