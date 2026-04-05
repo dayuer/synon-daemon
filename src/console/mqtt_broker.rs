@@ -28,7 +28,7 @@ use crate::console::session::SessionState;
 pub fn build_broker_config() -> Config {
     let connection_settings = ConnectionSettings {
         connection_timeout_ms: 60_000,
-        max_payload_size: 65_536,       // 64KB — 心跳 JSON 最大约 4KB，留足余量
+        max_payload_size: 256 * 1024,       // 256KB — 心跳含 skills 约 40KB，留足余量
         max_inflight_count: 100,
         auth: None,
         external_auth: None,

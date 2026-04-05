@@ -61,6 +61,8 @@ pub async fn run(
     let mut mqttoptions = MqttOptions::new(&client_id, &mqtt_host, mqtt_port);
     mqttoptions.set_keep_alive(Duration::from_secs(15));
     mqttoptions.set_clean_session(true);
+    // 心跳含 installed_skills 等大字段，约 40KB；默认 10KB 会导致 reconnect storm
+    mqttoptions.set_max_packet_size(256 * 1024, 256 * 1024); // 发送/接收均 256KB
     // LWT 遗嘱：TCP 异常断开时 Broker 自动发布 "offline"
     let lwt = LastWill::new(
         format!("synon/agent/{}/status", node_id),
