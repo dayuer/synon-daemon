@@ -1,34 +1,42 @@
 # Synon-Daemon
 
-**Synon-Daemon** 是 SynonClaw 中台架构下运行在每个受管边缘节点上的**纯 Rust 守护进程**（2MB，极低资源占用）。它作为一个核心控制平面代理，接管了节点侧所有的运维心跳上报、长连接命令下发与本地任务的执行。
+**Synon-Daemon** 是 SynonClaw 中台架构下的**核心纯 Rust 守护进程**（极低资源占用，跨平台静态编译）。经过底层通信架构重构，该服务目前运行模式分为**双端形态**：
+1. **Agent 面（边缘工作节点）**：接收并执行远端命令、高频上报状态采集信息、进程看门狗（Watchdog），并管理 AI 技能的分配与调用。
+2. **Console 面（中控台直连核心）**：运行在主控服务器上，内置了高吞吐量的 `rumqttd` 代理，串联控制平台与全网成百上千个 Agent 工作负载，并将数据持久化到 SQLite (`nodes.db`) 中，桥接给前端的 Next.js 服务。
 
-## 核心特性
+## 核心架构特性
 
-- **完全异步与非阻塞 (Tokio)**: 所有系统环境命令调用、API 请求及本地 I/O（如 `gnb_ctl`, `openclaw` CLI，配置文件读写）都被设计为 100% 异步执行。这意味着即使系统挂起或响应慢，长连接的心跳保活也不会被阻塞。
-- **并发任务串行排队与锁定 (exec_handler + task_executor)**: Console 下发的耗时任务（如包安装、技能安装等）通过 MPSC 通道进入局部的单并发状态机排队执行，带有防重入 `reqId` 锁定机制。有效防御多端管理员并发下达矛盾命令导致的任务风暴雪崩。
-- **降权隔离防护模型 (synon 身份)**: 该守护组件和后续分派执行的所有 Shell 操作，都在受限系统用户 `synon` 下进行，实现严格的权限降级与 RBAC 控制面板对接，禁止使用 root。
-- **WSS 长连接双通复用 (console_ws)**: 一号端点集成 gnb 隧道网络心跳、节点硬件健康状态上报及 Console/Web 操作大厅的直接双向 RPC 执行链路及实时 Shell 拦截功能。
-- **防内存泄漏与主动崩溃自测**: 各个连接、派生任务均有 Drop 保护和看门狗 (Watchdog) 保活保护。
+- **Ed25519 签名零信任认证**: 完全移除传统的明文 Token 依赖。Agent 节点在发送 MQTT 数据包时自动应用基于主控面板生成的非对称秘钥对进行时间戳 + Signature 签名，避免中间人或重放攻击。
+- **十万级并发的 MQTT TCP 协议**: 从原有的 WebSocket (WSS) 演进到了严酷网络长连接更稳定的 MQTT 机制。利用 `rumqttc` 在终端机建立健壮的 QoS 1 保活（心跳 30s）。
+- **双工作模式切换**:
+  - `synon-daemon console`: Console 模式，需要带 `--features console` 编译。内置本地 broker 与 SQLite 管理。
+  - `synon-daemon agent`: 或直接运行无参名二进制，Agent 模式。
+- **并发任务串行排队与防重入**: 控制台下发的任务指令具备全局锁，借助通道 MPSC 模型确保耗时任务的局域单点安全性。
+- **降权隔离防护模型**: （可选）所有 AI 调用及高危 Shell 代码过滤，被置于系统低权限 `synon` 用户层下运行。
 
-## 环境要求与运行
+## 环境与构建
 
-- 依赖: `gnb_ctl` (可选), `openclaw` (CLI / RPC proxy), `npm` (可选), `ip`。
-- 构建与部署: 项目随主管理控制台一同编译并使用 `initnode.sh` 进行自动化部署。
+随主控台 `scripts/initnode.sh` 或全链路构建体系联合部署打包。
 
-### 构建
+### 本地编译
+**1. 编译终端 Agent (纯净版, 裁剪了中控服务体积以分发)**
 ```bash
 cargo build --release
 ```
 
-## 目录结构
-- `src/main.rs`: 守护进程和 Watchdog 启动口。
-- `src/config.rs`: agent.conf + openclaw.json 配置加载器，Console URL 自动转 WSS。
-- `src/console_ws.rs`: Console WebSockets 连接生命周期与事件扇出。
-- `src/heartbeat.rs`: 系统综合信息高频汇聚采集器。
-- `src/task_executor.rs`: 单并发安全排队执行器。
-- `src/exec_handler.rs`: 系统安全命令白名单过滤与隔离执行沙箱。
-- `src/skills_manager.rs`: AI 技能全生命周期管理（安装/卸载/缓存）。
-- `src/gnb_controller.rs` / `src/gnb_monitor.rs`: 跨进程管控核心 `gnb_ctl` 的数据面监控。
-- `src/claw_manager.rs` / `src/claw_proxy.rs`: 开源大模型运维 AI 工具包的对接中介层。
-- `src/watchdog.rs`: GNB + OpenClaw 进程守护与异常重启告警。
-- `src/self_updater.rs`: OTA 自动更新（SHA256 校验 + 原子替换）。
+**2. 编译跳板中控台版 (包含全量 SQLite Driver 与 rumqttd)**
+```bash
+cargo build --release --features console
+```
+
+## 目录索引指南
+
+- `src/main.rs`: 守护进程双模启动入口及系统看门狗（Watchdog）配置。
+- `src/mqtt_agent.rs`: **[核心]** Agent 侧 MQTT 客户端的链路状态机、订阅事件树、Pub/Sub 及网络断供重连层。
+- `src/console/`: **[核心]** Console 中控台侧内置的 `mqtt_broker`, `auth` (Ed25519校验) 以及 `nodes.db` 实体状态更新器等。
+- `src/config.rs`: 统一读取 `agent.conf` 参数环境。
+- `src/heartbeat.rs`: Agent 各项硬件、网络探测的高频采集器。
+- `src/exec_handler.rs` / `src/task_executor.rs`: 安全命令白名单与局域单并发串行命令调度锁框架。
+- `src/skills_manager.rs`: Agent 侧自动化处理从 GitHub/源站获取并管理 AI 分析脚本的中心。
+- `src/self_updater.rs`: 面向节点自身的二进制热派发重载（OTA 更新验证）。
+- `src/claw_manager.rs` / `src/gnb_controller.rs`: 进程管控组件代理封装。
