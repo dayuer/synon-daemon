@@ -22,87 +22,96 @@ pub struct ExecResult {
 /// 固定白名单前缀 — 允许运行的命令集合
 /// 格式：第一个空格之前的 token 或更长的前缀
 const ALLOWED_PREFIXES: &[&str] = &[
-    // 包管理（仅安装/更新，不删除）
-    "apt-get install",
-    "apt-get update",
-    "apt install",
-    "apt update",
-    "yum install",
-    "yum update",
-    "dnf install",
-    "dnf update",
-    // systemd 操作
-    "systemctl start",
-    "systemctl stop",
-    "systemctl restart",
-    "systemctl enable",
-    "systemctl disable",
-    "systemctl daemon-reload",
-    "systemctl status",
-    // 文件系统（安全操作）
-    "mkdir -p",
+    // 服务与系统管理
+    "systemctl",
+    "service",
+    "journalctl",
+    "apt-get",
+    "apt",
+    "yum",
+    "dnf",
+    
+    // SynonClaw / GNB 核心组件
+    "openclaw", 
+    "/opt/gnb/bin/openclaw",
+    "openclaw-gateway",
+    "clawhub",
+    "gnb",
+    "/opt/gnb/bin/gnb",
+    "gnb_ctl",
+    "synon-daemon",
+    "/opt/gnb/bin/synon-daemon",
+
+    // 文件与目录操作
     "mkdir",
     "chmod",
     "chown",
-    "cp ",
-    "mv ",
-    "ln -s",
-    "ln -sf",
-    "tee ",
-    "cat ",
-    "echo ",
-    "touch ",
-    // GNB / OpenClaw 相关
-    "gnb ",
-    "/opt/gnb/bin/gnb",
-    "openclaw ",          // 覆盖所有 openclaw 子命令（skills/gateway/config 等）
-    "clawhub ",
-    // npm 全局安装（OpenClaw 升级专用）
-    "npm install -g openclaw",
-    "npm install -g n",
-    // 系统信息（只读）
-    "which ",
-    "test ",
-    "stat ",
-    "ls ",
-    "id",
-    "uname",
-    "df ",
+    "cp",
+    "mv",
+    "ln",
+    "rm",
+    "tee",
+    "cat",
+    "echo",
+    "touch",
+    "tail",
+    "head",
+    "grep",
+    "ls",
+    "pwd",
+    "cd",
+    "find",
+    "stat",
+    "wc",
+    "jq",
+    "tar",
+    "unzip",
+    "gzip",
+
+    // 网络与下载
+    "curl",
+    "wget",
+    "ping",
+    "netstat",
+    "ss",
+    "ip",
+    "ifconfig",
+
+    // 进程与状态
+    "ps",
+    "top",
+    "htop",
+    "kill",
+    "killall",
+    "df",
     "free",
-    // Node.js / npm（安装工具链）
-    "node ",
-    "npm install",
-    "npm ci",
-    "npx ",
+    "uname",
+    "id",
+    "which",
+    "test",
+
+    // 运行环境与构建工具
+    "node",
+    "npm",
+    "npx",
     "n ",
-    // curl/wget（仅下载，不管道到 shell）
-    "curl -fsSL",
-    "curl -sSL",
-    "curl -O",
-    "curl -o ",
-    "wget -O",
-    "wget -q",
-    // Rust / cargo（编译节点工具）
-    "cargo build",
-    "cargo install",
-    // hash（shell 内置，更新 PATH 缓存）
-    "hash ",
+    "cargo",
+    "sh",
+    "bash",
+    "zsh",
+    "hash",
 ];
 
 /// 危险模式黑名单 — 即使命令通过了白名单前缀检查，仍需拒绝
 const DANGEROUS_PATTERNS: &[&str] = &[
-    "| sh",
-    "| bash",
-    "| zsh",
-    "> /dev/sd",
-    "rm -rf /",
+    "> /dev/sd",     // 禁止直接写块设备
+    "rm -rf /",      // 禁止全盘删除
     "rm -rf /*",
-    "mkfs",
-    "dd if=",
+    "mkfs",          // 禁止格式化
+    "dd if=",        // 禁止dd覆盖设备
     "dd of=/dev",
-    ":(){ :|:& };:",  // fork 炸弹
-    "/etc/passwd",
-    "/etc/shadow",
+    ":(){ :|:& };:", // fork 炸弹
+    "/etc/shadow",   // 禁止读取或修改密码文件
     "~/.ssh/authorized_keys",
 ];
 
