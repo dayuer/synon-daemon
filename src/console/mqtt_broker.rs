@@ -222,6 +222,25 @@ async fn handle_mqtt_message(
                              VALUES (?1, ?1, 'online', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
                             rusqlite::params![nid_owned],
                         );
+
+                        // @v7: 任务补齐 — dispatched 回退 queued（不算重试）
+                        let reset_count = conn.execute(
+                            "UPDATE agent_tasks 
+                             SET status = 'queued'
+                             WHERE nodeId = ?1 
+                             AND status = 'dispatched'
+                             AND (expiresAt IS NULL OR expiresAt > datetime('now'))",
+                            rusqlite::params![nid_owned],
+                        ).unwrap_or(0);
+                        if reset_count > 0 {
+                            tracing::info!(
+                                "[TaskCatchup] 节点 {} 上线，{} 个 dispatched 任务回退 queued",
+                                nid_owned, reset_count
+                            );
+                        }
+
+                        // @v7: 广播补录 — 检查活跃广播中该节点是否缺少子任务
+                        broadcast_catchup(conn, &nid_owned);
                     }
                     conn.execute(
                         "UPDATE nodes SET status = ?1, updatedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
@@ -256,19 +275,72 @@ async fn handle_mqtt_message(
         return;
     }
 
-    // synon/agent/{node_id}/event — claw_event / watchdog_alert
+    // synon/agent/{node_id}/event — claw_event / watchdog_alert / task_sync
     if parts.len() == 4 && parts[0] == "synon" && parts[1] == "agent" && parts[3] == "event" {
         if let Ok(json_str) = std::str::from_utf8(payload) {
+            // @v7: 检查是否为 task_sync 请求
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if json.get("type").and_then(|v| v.as_str()) == Some("task_sync") {
+                    let node_id = parts[2].to_string();
+                    let db = db_pool.clone();
+                    tokio::spawn(async move {
+                        if let Ok(c) = db.get().await {
+                            let _ = c.interact(move |conn| {
+                                // dispatched → queued 回退
+                                let reset = conn.execute(
+                                    "UPDATE agent_tasks SET status = 'queued'
+                                     WHERE nodeId = ?1 AND status = 'dispatched'
+                                     AND (expiresAt IS NULL OR expiresAt > datetime('now'))",
+                                    rusqlite::params![node_id],
+                                ).unwrap_or(0);
+                                if reset > 0 {
+                                    tracing::info!(
+                                        "[TaskSync] Agent {} 请求补齐，{} 个任务回退 queued",
+                                        node_id, reset
+                                    );
+                                }
+                                // 广播补录
+                                broadcast_catchup(conn, &node_id);
+                            }).await;
+                        }
+                    });
+                    return; // task_sync 不广播给 UI
+                }
+            }
             session.broadcast_to_ui(json_str).await;
         }
         return;
     }
 
-    // synon/result/{node_id}/{req_id} — 任务回执
+    // synon/result/{node_id}/{req_id} — 任务回执 / ACK
     if parts.len() == 4 && parts[0] == "synon" && parts[1] == "result" {
         let task_id = parts[3];
         if let Ok(json_str) = std::str::from_utf8(payload) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                // @v7: 区分 task_ack 和 cmd_result
+                let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("cmd_result");
+
+                if msg_type == "task_ack" {
+                    // ACK: 确认收到，更新状态为 acked
+                    let db = db_pool.clone();
+                    let tid = task_id.to_string();
+                    tokio::spawn(async move {
+                        if let Ok(c) = db.get().await {
+                            let _ = c.interact(move |conn| {
+                                conn.execute(
+                                    "UPDATE agent_tasks 
+                                     SET status = 'acked', 
+                                         ackedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
+                                     WHERE taskId = ?1 AND status = 'dispatched'",
+                                    rusqlite::params![tid],
+                                )
+                            }).await;
+                        }
+                    });
+                    return;
+                }
+
+                // cmd_result: 最终执行结果
                 let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 let status_str = if ok { "success" } else { "failed" };
                 let payload_str = json.get("payload").and_then(|p| p.as_str()).unwrap_or("");
@@ -291,7 +363,17 @@ async fn handle_mqtt_message(
                                      completedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
                                  WHERE taskId = ?4",
                                 rusqlite::params![ss, so, se, tid],
-                            )
+                            ).ok();
+
+                            // @v7: 广播任务进度更新
+                            let broadcast_id: Option<String> = conn.query_row(
+                                "SELECT broadcastId FROM agent_tasks WHERE taskId = ?1 AND broadcastId != ''",
+                                rusqlite::params![tid],
+                                |r| r.get(0),
+                            ).ok();
+                            if let Some(bid) = broadcast_id {
+                                update_broadcast_progress(conn, &bid);
+                            }
                         }).await;
                     }
                 });
@@ -301,4 +383,86 @@ async fn handle_mqtt_message(
     }
 
     tracing::debug!("[MqttBroker] 未匹配主题: {}", topic);
+}
+
+/// 广播补录：检查活跃广播中该节点是否缺少子任务，补建行
+fn broadcast_catchup(conn: &rusqlite::Connection, node_id: &str) {
+    let active_broadcasts: Vec<(String, String, String)> = conn.prepare(
+        "SELECT broadcastId, type, command FROM broadcast_tasks 
+         WHERE status NOT IN ('completed', 'expired')
+         AND (expiresAt IS NULL OR expiresAt > datetime('now'))"
+    ).and_then(|mut stmt| {
+        stmt.query_map([], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        )))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    }).unwrap_or_default();
+
+    for (bid, task_type, command) in active_broadcasts {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM agent_tasks 
+             WHERE broadcastId = ?1 AND nodeId = ?2",
+            rusqlite::params![bid, node_id],
+            |r| r.get(0),
+        ).unwrap_or(true);
+
+        if !exists {
+            let task_id = format!("{}-{}", bid, node_id);
+            let _ = conn.execute(
+                "INSERT INTO agent_tasks 
+                 (taskId, nodeId, type, command, scope, broadcastId, 
+                  status, queuedAt, maxRetries, retryCount, expiresAt)
+                 VALUES (?1, ?2, ?3, ?4, 'broadcast', ?5, 
+                         'queued', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 3, 0,
+                         (SELECT expiresAt FROM broadcast_tasks WHERE broadcastId = ?5))",
+                rusqlite::params![task_id, node_id, task_type, command, bid],
+            );
+            // 更新广播计数
+            let _ = conn.execute(
+                "UPDATE broadcast_tasks SET totalNodes = totalNodes + 1 
+                 WHERE broadcastId = ?1",
+                rusqlite::params![bid],
+            );
+            tracing::info!(
+                "[BroadcastCatchup] 节点 {} 补录广播任务 {} (taskId={})",
+                node_id, bid, task_id
+            );
+        }
+    }
+}
+
+/// 更新广播任务的完成进度
+fn update_broadcast_progress(conn: &rusqlite::Connection, broadcast_id: &str) {
+    #[derive(Default)]
+    struct Stats { total: i64, completed: i64, failed: i64 }
+
+    let stats = conn.query_row(
+        "SELECT COUNT(*) AS total,
+                SUM(CASE WHEN status IN ('success', 'completed') THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status IN ('failed', 'exhausted') THEN 1 ELSE 0 END) AS failed
+         FROM agent_tasks WHERE broadcastId = ?1",
+        rusqlite::params![broadcast_id],
+        |r| Ok(Stats {
+            total: r.get(0)?,
+            completed: r.get(1)?,
+            failed: r.get(2)?,
+        }),
+    ).unwrap_or_default();
+
+    let all_done = (stats.completed + stats.failed) >= stats.total;
+    let status = if all_done {
+        if stats.failed > 0 { "partial_failure" } else { "completed" }
+    } else {
+        "dispatching"
+    };
+
+    let _ = conn.execute(
+        "UPDATE broadcast_tasks 
+         SET completedNodes = ?1, failedNodes = ?2, status = ?3,
+             completedAt = CASE WHEN ?4 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END
+         WHERE broadcastId = ?5",
+        rusqlite::params![stats.completed, stats.failed, status, all_done, broadcast_id],
+    );
 }

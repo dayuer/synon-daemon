@@ -13,25 +13,79 @@ struct AgentTask {
 }
 
 /// 后台定期轮询 agent_tasks 表，通过 MQTT 将 queued 任务下发给 Agent。
+/// @v7: 智能调度（只推送在线节点）+ 超时回退 + 过期清理
 pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: LinkTx) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     let mut last_dream_at = std::time::Instant::now();
+    let mut last_timeout_check = std::time::Instant::now();
     let mut is_idle = false;
     
     loop {
         interval.tick().await;
 
-        // 1. 获取当前处于 queued 的任务
+        // ── 超时回退 + 过期清理（每 30s）──────────────────────
+        if last_timeout_check.elapsed().as_secs() >= 30 {
+            last_timeout_check = std::time::Instant::now();
+            let pool_gc = db_pool.clone();
+            tokio::spawn(async move {
+                if let Ok(conn) = pool_gc.get().await {
+                    let _ = conn.interact(move |c| {
+                        // dispatched >120s 未 acked → 回退 queued (retryCount++)
+                        let reset = c.execute(
+                            "UPDATE agent_tasks
+                             SET status = 'queued', retryCount = retryCount + 1
+                             WHERE status = 'dispatched'
+                             AND dispatchedAt < datetime('now', '-120 seconds')
+                             AND retryCount < maxRetries
+                             AND (expiresAt IS NULL OR expiresAt > datetime('now'))",
+                            [],
+                        ).unwrap_or(0);
+                        if reset > 0 {
+                            tracing::info!("[TaskQueue] 超时回退 {} 个 dispatched 任务", reset);
+                        }
+
+                        // retryCount >= maxRetries → exhausted
+                        let exhausted = c.execute(
+                            "UPDATE agent_tasks SET status = 'exhausted'
+                             WHERE status IN ('dispatched', 'queued')
+                             AND retryCount >= maxRetries",
+                            [],
+                        ).unwrap_or(0);
+                        if exhausted > 0 {
+                            tracing::warn!("[TaskQueue] {} 个任务已耗尽重试 → exhausted", exhausted);
+                        }
+
+                        // 过期清理
+                        let expired = c.execute(
+                            "UPDATE agent_tasks SET status = 'expired'
+                             WHERE status IN ('queued', 'dispatched')
+                             AND expiresAt IS NOT NULL
+                             AND expiresAt < datetime('now')",
+                            [],
+                        ).unwrap_or(0);
+                        if expired > 0 {
+                            tracing::info!("[TaskQueue] 清理 {} 个过期任务", expired);
+                        }
+                    }).await;
+                }
+            });
+        }
+
+        // ── 获取在线节点的 queued 任务 ───────────────────────
         let pool = db_pool.clone();
         let tasks = match pool.get().await {
             Ok(conn) => {
                 let res = conn.interact(move |c| -> Result<Vec<AgentTask>, rusqlite::Error> {
+                    // @v7: JOIN nodes 表，只取在线节点的任务
                     let mut stmt = c.prepare(
-                        "SELECT taskId, nodeId, type, command 
-                         FROM agent_tasks 
-                         WHERE status = 'queued'
-                         ORDER BY queuedAt ASC
-                         LIMIT 50" // 每次取最多50条防拥塞
+                        "SELECT t.taskId, t.nodeId, t.type, t.command
+                         FROM agent_tasks t
+                         INNER JOIN nodes n ON t.nodeId = n.id
+                         WHERE t.status = 'queued'
+                         AND n.status IN ('online', 'approved')
+                         AND (t.expiresAt IS NULL OR t.expiresAt > datetime('now'))
+                         ORDER BY t.queuedAt ASC
+                         LIMIT 50"
                     )?;
                     
                     let rows = stmt.query_map([], |row| {

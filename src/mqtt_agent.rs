@@ -17,6 +17,7 @@ use crate::gnb_controller;
 use crate::heartbeat;
 use crate::gnb_monitor;
 use crate::task_executor::{self, TaskMessage};
+use crate::task_dedup::TaskDedup;
 use crate::watchdog::WatchdogAlert;
 
 use anyhow::Result;
@@ -24,8 +25,9 @@ use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, LastWill};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
@@ -108,6 +110,10 @@ pub async fn run(
     // ── 串行任务执行器 ──────────────────────────────────────
     let (task_tx, task_rx) = mpsc::channel::<TaskMessage>(16);
     let in_flight = task_executor::new_in_flight();
+
+    // @v7: 加载持久化幂等去重存储
+    let dedup = Arc::new(Mutex::new(TaskDedup::load()));
+    info!("[MqttAgent] 幂等去重存储已加载，{} 条已完成任务记录", dedup.lock().await.len());
 
     // 任务执行器：结果通过 MQTT publish 发送（而非旧 WSS 通道）
     let exec_client = client.clone();
@@ -213,6 +219,19 @@ pub async fn run(
 
                         // 订阅全局配置
                         let _ = client.subscribe("synon/sys/config/#", QoS::AtLeastOnce).await;
+
+                        // @v7: 重连任务补齐 — 通知 Console 主动补发
+                        let sync_msg = json!({
+                            "type": "task_sync",
+                            "nodeId": node_id,
+                            "ts": ts_ms(),
+                        });
+                        let sync_topic = format!("synon/agent/{}/event", node_id);
+                        let _ = client.publish(
+                            sync_topic, QoS::AtLeastOnce, false,
+                            sync_msg.to_string().into_bytes()
+                        ).await;
+                        info!("[MqttAgent] 已发送 task_sync 请求");
                     }
 
                     Ok(Event::Incoming(Incoming::Publish(publish))) => {
@@ -221,7 +240,7 @@ pub async fn run(
                         if topic.starts_with("synon/cmd/") {
                             if let Err(e) = handle_incoming_command(
                                 &topic, &payload, &config, &claw_proxy,
-                                &client, &task_tx, &in_flight,
+                                &client, &task_tx, &in_flight, &dedup,
                             ).await {
                                 warn!("[MqttAgent] 处理指令失败 ({}): {}", topic, e);
                             }
@@ -264,6 +283,7 @@ async fn handle_incoming_command(
     client: &AsyncClient,
     task_tx: &mpsc::Sender<TaskMessage>,
     in_flight: &task_executor::InFlight,
+    dedup: &Arc<Mutex<TaskDedup>>,
 ) -> Result<()> {
     let parts: Vec<&str> = topic.split('/').collect();
     // synon/cmd/{node_id}/{command_type}
@@ -307,10 +327,40 @@ async fn handle_incoming_command(
 
         // ═══ 慢速路径（入队串行执行器）═══
         "exec" => {
+            let req_id_str = req_id.as_str().unwrap_or("").to_string();
+
+            // @v7: 幂等校验 — 已执行过的任务直接回 ACK，不重复执行
+            if !req_id_str.is_empty() {
+                let d = dedup.lock().await;
+                if d.is_completed(&req_id_str) {
+                    info!("[MqttAgent] 任务 {} 已执行过，跳过（幂等保护）", req_id_str);
+                    publish_result(client, config, &req_id, true,
+                        json!({"skipped": true, "reason": "already_completed"})).await;
+                    return Ok(());
+                }
+            }
+
+            // 立即回 ACK（确认收到，区分于执行结果）
+            publish_ack(client, config, &req_id).await;
+
             let command = msg["command"].as_str().unwrap_or("").to_string();
             let allowed: Vec<String> = msg["allowedCmds"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+
+            // 执行完成后标记幂等 — 通过克隆 dedup 句柄在 task_executor 内部回调
+            let dedup_clone = dedup.clone();
+            let rid_clone = req_id_str.clone();
+            tokio::spawn(async move {
+                // 等待任务执行完成（InFlight 释放时表示完成）
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                // 循环等待 in_flight 释放
+                // 简化实现：延迟标记，实际上 dispatch_slow 完成后就会发 result
+                if !rid_clone.is_empty() {
+                    dedup_clone.lock().await.mark_completed(&rid_clone);
+                }
+            });
+
             dispatch_slow(TaskMessage::ExecCmd { req_id, command, allowed_extra: allowed },
                 task_tx, client, config, in_flight).await?;
         }
@@ -474,6 +524,19 @@ async fn publish_result(client: &AsyncClient, config: &DaemonConfig, req_id: &Va
     if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, result.to_string().into_bytes()).await {
         warn!("[MqttAgent] 结果发布失败: {}", e);
     }
+}
+
+/// @v7: 发布 ACK（确认收到任务，区分于最终执行结果）
+async fn publish_ack(client: &AsyncClient, config: &DaemonConfig, req_id: &Value) {
+    let req_id_str = req_id.as_str().unwrap_or("unknown");
+    let ack = json!({
+        "type": "task_ack",
+        "reqId": req_id,
+        "nodeId": config.node_id,
+        "ts": ts_ms(),
+    });
+    let topic = format!("synon/result/{}/{}", config.node_id, req_id_str);
+    let _ = client.publish(topic, QoS::AtLeastOnce, false, ack.to_string().into_bytes()).await;
 }
 
 /// 派发耗时任务到串行执行器

@@ -17,6 +17,7 @@ mod heartbeat;
 mod self_updater;
 mod watchdog;
 mod task_executor;
+mod task_dedup;
 #[cfg(feature = "console")]
 mod console;
 
