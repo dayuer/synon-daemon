@@ -343,11 +343,13 @@ async fn handle_mqtt_message(
                 // cmd_result: 最终执行结果
                 let ok = json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 let status_str = if ok { "success" } else { "failed" };
-                let payload_str = json.get("payload").and_then(|p| p.as_str()).unwrap_or("");
-                let stderr_str = if !ok {
-                    json.get("stderr").and_then(|e| e.as_str()).unwrap_or(payload_str)
-                } else { "" };
-                let stdout_str = if ok { payload_str } else { "" };
+                // 兼容两种格式：Agent 发 stdout/stderr，旧格式用 payload
+                let stdout_str = json.get("stdout").and_then(|v| v.as_str())
+                    .or_else(|| if ok { json.get("payload").and_then(|v| v.as_str()) } else { None })
+                    .unwrap_or("");
+                let stderr_str = json.get("stderr").and_then(|v| v.as_str())
+                    .or_else(|| if !ok { json.get("payload").and_then(|v| v.as_str()) } else { None })
+                    .unwrap_or("");
 
                 let db = db_pool.clone();
                 let tid = task_id.to_string();
