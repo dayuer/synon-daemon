@@ -20,7 +20,7 @@ use tracing::debug;
 #[serde(rename_all = "camelCase")]
 pub struct SysInfo {
     /// 时间戳（ms since epoch，与旧格式兼容）
-    pub ts: String,
+    pub ts: u64,
     /// CPU 使用率 (0.0 ~ 100.0)
     pub cpu_percent: f64,
     /// 内存使用率 (0.0 ~ 100.0)
@@ -83,7 +83,7 @@ pub fn init(gnb_map_path: String, claw_port: u16) {
 pub async fn collect() -> Result<SysInfo> {
     let ts = {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        format!("{}000", now.as_secs()) // ms 格式，JavaScript 端兼容
+        now.as_secs() * 1000 + now.subsec_millis() as u64
     };
 
     // 并行采集各模块（CPU 需要 100ms 间隔，其余同步）

@@ -8,8 +8,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::claw_manager;
@@ -80,31 +78,6 @@ pub fn try_claim(set: &InFlight, req_id: &str) -> bool {
         return true; // 无 reqId 不做去重
     }
     set.lock().unwrap().insert(req_id.to_string())
-}
-
-/// 串行执行器主循环
-pub async fn run(
-    mut task_rx: mpsc::Receiver<TaskMessage>,
-    resp_tx: mpsc::Sender<Message>,
-    in_flight: InFlight,
-) {
-    while let Some(task) = task_rx.recv().await {
-        let req_id_s = task.req_id_str();
-        let response = execute(task).await;
-
-        if resp_tx.send(Message::Text(response)).await.is_err() {
-            warn!("[TaskExecutor] WS write channel 已关闭，退出");
-            break;
-        }
-
-        // 移除 in-flight 标记
-        if !req_id_s.is_empty() {
-            if let Ok(mut set) = in_flight.lock() {
-                set.remove(&req_id_s);
-            }
-        }
-    }
-    info!("[TaskExecutor] 执行器退出");
 }
 
 /// 执行单个任务，返回 JSON 响应字符串

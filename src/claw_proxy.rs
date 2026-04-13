@@ -198,17 +198,6 @@ impl ClawProxy {
         cfg["gateway"]["auth"]["token"].as_str().map(|s| s.to_string())
     }
 
-    /// 检查 OpenClaw 是否可达（GET /v1/models）
-    pub async fn ping(&self) -> bool {
-        self.client
-            .get(format!("{}/v1/models", self.base_url))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-    }
-
     /// 获取 OpenClaw 状态（通过 CLI 子进程，最可靠）
     pub async fn get_status(&self) -> ClawStatus {
         let output = tokio::process::Command::new("openclaw")

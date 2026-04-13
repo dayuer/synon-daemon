@@ -5,10 +5,12 @@ use axum::{
     response::IntoResponse,
 };
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use serde::Deserialize;
 use futures_util::{StreamExt, SinkExt};
 use axum::extract::ws::Message;
+use rumqttd::local::LinkTx;
 
 pub mod db;
 pub mod session;
@@ -21,6 +23,7 @@ pub mod auth;
 pub struct AppState {
     pub db_pool: deadpool_sqlite::Pool,
     pub session: session::SessionState,
+    pub mqtt_tx: Arc<Mutex<LinkTx>>,
 }
 
 pub async fn run_server(config_path: String, shutdown_token: CancellationToken) {
@@ -40,17 +43,6 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
 
     // 初始化会话池
     let session_state = session::SessionState::new();
-
-    let state = AppState {
-        db_pool: pool.clone(),
-        session: session_state.clone(),
-    };
-
-    // 构建 Axum 路由
-    let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
-        .route("/ws", get(ws_handler))
-        .with_state(state);
 
     // 拉起 MQTT Broker + 内部消费者桥接
     let (mut broker, link_tx, link_rx, dispatcher_tx) = mqtt_broker::create_broker();
@@ -74,11 +66,25 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
         ).await;
     });
 
+    // dispatcher_tx 共享给 state（Web UI 实时下发）和 task_queue（定时调度）
+    let shared_dispatcher = Arc::new(Mutex::new(dispatcher_tx));
+    let state = AppState {
+        db_pool: pool.clone(),
+        session: session_state.clone(),
+        mqtt_tx: shared_dispatcher.clone(),
+    };
+
+    // 构建 Axum 路由
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .route("/ws", get(ws_handler))
+        .with_state(state);
+
     // 拉起离线任务排队引擎（使用 MQTT dispatcher link 下发指令）
     let db_pool_for_tq = pool.clone();
     let session_for_tq = session_state.clone();
     tokio::spawn(async move {
-        task_queue::run_scheduler(db_pool_for_tq, session_for_tq, dispatcher_tx).await;
+        task_queue::run_scheduler(db_pool_for_tq, session_for_tq, shared_dispatcher).await;
     });
 
     let port: u16 = std::env::var("CONSOLE_BACKEND_PORT")
@@ -175,8 +181,11 @@ async fn handle_ui_socket(socket: WebSocket, state: AppState) {
                                     let ack = serde_json::json!({ "type": "auth_ok" });
                                     let _ = tx.send(Message::Text(ack.to_string()));
                                 }
+                                "dispatch" => {
+                                    // Web UI → Agent 实时指令下发
+                                    handle_web_dispatch(&json, &state, &tx).await;
+                                }
                                 _ => {
-                                    // TODO: 可扩展 — 转发 web 指令给指定 agent
                                     tracing::debug!("Web UI {} 发送: {}", session_id, msg_type);
                                 }
                             }
@@ -194,6 +203,73 @@ async fn handle_ui_socket(socket: WebSocket, state: AppState) {
     // 断开时清理
     tracing::info!("Web UI [{}] 断开连接", session_id);
     state.session.remove_ui(&session_id).await;
+}
+
+/// 处理 Web UI 的实时指令下发请求
+///
+/// 期望 JSON 格式:
+/// ```json
+/// {
+///   "type": "dispatch",
+///   "nodeId": "node-abc",
+///   "cmdType": "exec",        // exec | claw_rpc | skill_install | ...
+///   "payload": { ... }        // 透传给 Agent 的完整 payload（需含 reqId）
+/// }
+/// ```
+async fn handle_web_dispatch(
+    json: &serde_json::Value,
+    state: &AppState,
+    tx: &tokio::sync::mpsc::UnboundedSender<Message>,
+) {
+    let node_id = match json.get("nodeId").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => {
+            let err = serde_json::json!({ "type": "dispatch_error", "error": "缺少 nodeId" });
+            let _ = tx.send(Message::Text(err.to_string()));
+            return;
+        }
+    };
+    let cmd_type = match json.get("cmdType").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => {
+            let err = serde_json::json!({ "type": "dispatch_error", "error": "缺少 cmdType" });
+            let _ = tx.send(Message::Text(err.to_string()));
+            return;
+        }
+    };
+    let payload = json.get("payload").cloned().unwrap_or(serde_json::json!({}));
+
+    // 补充 reqId（如果 payload 中没有）
+    let mut payload = payload;
+    if payload.get("reqId").is_none() {
+        payload["reqId"] = serde_json::json!(format!("ws-{}", uuid::Uuid::new_v4()));
+    }
+
+    let topic = format!("synon/cmd/{}/{}", node_id, cmd_type);
+    let payload_bytes = payload.to_string().into_bytes();
+
+    let publish_result = state.mqtt_tx.lock().unwrap().publish(topic.clone(), payload_bytes);
+    match publish_result {
+        Ok(_) => {
+            tracing::info!("[WebDispatch] 指令已下发: topic={} reqId={}", topic, payload["reqId"]);
+            let ack = serde_json::json!({
+                "type": "dispatch_ack",
+                "reqId": payload["reqId"],
+                "nodeId": node_id,
+                "cmdType": cmd_type,
+            });
+            let _ = tx.send(Message::Text(ack.to_string()));
+        }
+        Err(e) => {
+            tracing::warn!("[WebDispatch] MQTT 下发失败: {}", e);
+            let err = serde_json::json!({
+                "type": "dispatch_error",
+                "reqId": payload["reqId"],
+                "error": format!("MQTT 下发失败: {}", e),
+            });
+            let _ = tx.send(Message::Text(err.to_string()));
+        }
+    }
 }
 
     // 获取当前毫秒时间戳
