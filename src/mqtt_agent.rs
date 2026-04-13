@@ -119,8 +119,9 @@ pub async fn run(
     let exec_client = client.clone();
     let exec_node_id = node_id.clone();
     let exec_in_flight = in_flight.clone();
+    let exec_dedup = dedup.clone();
     tokio::spawn(async move {
-        run_task_executor(task_rx, exec_client, exec_node_id, exec_in_flight).await;
+        run_task_executor(task_rx, exec_client, exec_node_id, exec_in_flight, exec_dedup).await;
     });
 
     // ── 心跳发送循环 ────────────────────────────────────────
@@ -348,19 +349,6 @@ async fn handle_incoming_command(
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            // 执行完成后标记幂等 — 通过克隆 dedup 句柄在 task_executor 内部回调
-            let dedup_clone = dedup.clone();
-            let rid_clone = req_id_str.clone();
-            tokio::spawn(async move {
-                // 等待任务执行完成（InFlight 释放时表示完成）
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                // 循环等待 in_flight 释放
-                // 简化实现：延迟标记，实际上 dispatch_slow 完成后就会发 result
-                if !rid_clone.is_empty() {
-                    dedup_clone.lock().await.mark_completed(&rid_clone);
-                }
-            });
-
             dispatch_slow(TaskMessage::ExecCmd { req_id, command, allowed_extra: allowed },
                 task_tx, client, config, in_flight).await?;
         }
@@ -574,6 +562,7 @@ async fn run_task_executor(
     client: AsyncClient,
     node_id: String,
     in_flight: task_executor::InFlight,
+    dedup: Arc<Mutex<TaskDedup>>,
 ) {
     while let Some(task) = task_rx.recv().await {
         let req_id_s = task.req_id_str();
@@ -583,6 +572,11 @@ async fn run_task_executor(
         let topic = format!("synon/result/{}/{}", node_id, req_id_s);
         if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, response_json.into_bytes()).await {
             warn!("[MqttAgent] 任务结果发布失败: {}", e);
+        }
+
+        // 任务完成并已上报结果，标记幂等去重
+        if !req_id_s.is_empty() {
+            dedup.lock().await.mark_completed(&req_id_s);
         }
 
         // 移除 in-flight

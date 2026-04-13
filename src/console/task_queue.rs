@@ -1,6 +1,7 @@
 use rumqttd::local::LinkTx;
 use deadpool_sqlite::Pool;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::console::session::SessionState;
 
@@ -14,7 +15,7 @@ struct AgentTask {
 
 /// 后台定期轮询 agent_tasks 表，通过 MQTT 将 queued 任务下发给 Agent。
 /// @v7: 智能调度（只推送在线节点）+ 超时回退 + 过期清理
-pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: LinkTx) {
+pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mqtt_tx: Arc<Mutex<LinkTx>>) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     let mut last_dream_at = std::time::Instant::now();
     let mut last_timeout_check = std::time::Instant::now();
@@ -144,7 +145,7 @@ pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: L
                 "exec_cmd" => ("exec", json!({
                     "reqId": task.task_id,
                     "command": task.command,
-                    "allowedCmds": ["*"] // TODO: 细粒度白名单安全校验
+                    "allowedCmds": []
                 })),
                 "skill_install" => ("skill_install", json!({
                     "reqId": task.task_id,
@@ -175,7 +176,8 @@ pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: L
             // 通过 MQTT publish 下发指令
             let topic = format!("synon/cmd/{}/{}", task.node_id, cmd_type);
             let payload_bytes = msg_payload.to_string().into_bytes();
-            match mqtt_tx.publish(topic.clone(), payload_bytes) {
+            let publish_result = mqtt_tx.lock().unwrap().publish(topic.clone(), payload_bytes);
+            match publish_result {
                 Ok(_) => {
                     tracing::info!("[TaskQueue] 任务 {} 已通过 MQTT 下发到 {} (topic={})", 
                         task.task_id, task.node_id, topic);
@@ -188,7 +190,7 @@ pub async fn run_scheduler(db_pool: Pool, _session: SessionState, mut mqtt_tx: L
                                 c.execute(
                                     "UPDATE agent_tasks 
                                      SET status = 'dispatched', 
-                                         dispatchedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
+                                         dispatchedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                                      WHERE taskId = ?1",
                                     rusqlite::params![tid]
                                 )

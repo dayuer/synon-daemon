@@ -96,14 +96,14 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "npx",
     "n ",
     "cargo",
-    "sh",
-    "bash",
-    "zsh",
     "hash",
 ];
 
 /// 危险模式黑名单 — 即使命令通过了白名单前缀检查，仍需拒绝
 const DANGEROUS_PATTERNS: &[&str] = &[
+    "| sh",          // 禁止管道到 shell（RCE 防护）
+    "| bash",
+    "| zsh",
     "> /dev/sd",     // 禁止直接写块设备
     "rm -rf /",      // 禁止全盘删除
     "rm -rf /*",
@@ -111,6 +111,7 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "dd if=",        // 禁止dd覆盖设备
     "dd of=/dev",
     ":(){ :|:& };:", // fork 炸弹
+    "/etc/passwd",   // 禁止读取用户列表
     "/etc/shadow",   // 禁止读取或修改密码文件
     "~/.ssh/authorized_keys",
 ];

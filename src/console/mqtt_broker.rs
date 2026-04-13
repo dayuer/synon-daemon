@@ -328,9 +328,9 @@ async fn handle_mqtt_message(
                         if let Ok(c) = db.get().await {
                             let _ = c.interact(move |conn| {
                                 conn.execute(
-                                    "UPDATE agent_tasks 
-                                     SET status = 'acked', 
-                                         ackedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
+                                    "UPDATE agent_tasks
+                                     SET status = 'acked',
+                                         ackedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                                      WHERE taskId = ?1 AND status = 'dispatched'",
                                     rusqlite::params![tid],
                                 )
@@ -360,9 +360,9 @@ async fn handle_mqtt_message(
                     if let Ok(c) = db.get().await {
                         let _ = c.interact(move |conn| {
                             conn.execute(
-                                "UPDATE agent_tasks 
+                                "UPDATE agent_tasks
                                  SET status = ?1, resultStdout = ?2, resultStderr = ?3,
-                                     completedAt = strftime('%Y-%m-%dT%H:%M:%f%z', 'now') 
+                                     completedAt = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                                  WHERE taskId = ?4",
                                 rusqlite::params![ss, so, se, tid],
                             ).ok();
@@ -413,10 +413,10 @@ fn broadcast_catchup(conn: &rusqlite::Connection, node_id: &str) {
         if !exists {
             let task_id = format!("{}-{}", bid, node_id);
             let _ = conn.execute(
-                "INSERT INTO agent_tasks 
-                 (taskId, nodeId, type, command, scope, broadcastId, 
+                "INSERT OR IGNORE INTO agent_tasks
+                 (taskId, nodeId, type, command, scope, broadcastId,
                   status, queuedAt, maxRetries, retryCount, expiresAt)
-                 VALUES (?1, ?2, ?3, ?4, 'broadcast', ?5, 
+                 VALUES (?1, ?2, ?3, ?4, 'broadcast', ?5,
                          'queued', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 3, 0,
                          (SELECT expiresAt FROM broadcast_tasks WHERE broadcastId = ?5))",
                 rusqlite::params![task_id, node_id, task_type, command, bid],
