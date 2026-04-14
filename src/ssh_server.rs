@@ -18,7 +18,20 @@ use anyhow::Result;
 pub async fn run_agent_ssh_server(shutdown: CancellationToken) {
     // 加载 Agent host key
     let host_key_path = std::env::var("SSH_AGENT_HOST_KEY")
-        .unwrap_or_else(|_| "ssh_keys/agent_host_key".to_string());
+        .unwrap_or_else(|_| "/opt/gnb/etc/keys/agent_host_key".to_string());
+
+    // 路径安全校验：env 覆盖的路径必须在授权目录下
+    if std::env::var("SSH_AGENT_HOST_KEY").is_ok() {
+        let p = std::path::Path::new(&host_key_path);
+        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let authorized = canonical.starts_with("/opt/gnb/etc/keys/")
+            || canonical.starts_with("/etc/ssh/")
+            || canonical.is_relative();
+        if !authorized {
+            tracing::error!("[Agent-SSH] host key 路径不在授权目录下: {}", canonical.display());
+            return;
+        }
+    }
 
     let host_key = match load_key(&host_key_path) {
         Ok(k) => k,
@@ -30,7 +43,7 @@ pub async fn run_agent_ssh_server(shutdown: CancellationToken) {
 
     // 加载 authorized_keys（仅信任 Console client key）
     let authorized_keys_path = std::env::var("SSH_AGENT_AUTHORIZED_KEYS")
-        .unwrap_or_else(|_| "ssh_keys/authorized_keys".to_string());
+        .unwrap_or_else(|_| "/opt/gnb/etc/keys/authorized_keys".to_string());
 
     let authorized_keys = match load_authorized_keys(&authorized_keys_path) {
         Ok(keys) => keys,
@@ -62,11 +75,26 @@ pub async fn run_agent_ssh_server(shutdown: CancellationToken) {
 
     tracing::info!("[Agent-SSH] SSH Server 启动，监听 {}:{}", bind_addr, bind_port);
 
+    // 连接数信号量 — 防止资源耗尽
+    let max_conns: usize = std::env::var("SSH_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "32".to_string())
+        .parse()
+        .unwrap_or(32);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+    tracing::info!("[Agent-SSH] 最大并发连接数: {}", max_conns);
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!("[Agent-SSH] 拒绝连接 (已达上限 {}): {}", max_conns, peer_addr);
+                                continue;
+                            }
+                        };
                         let mut server = AgentSshServer {
                             authorized_keys: Arc::new(authorized_keys.clone()),
                         };
@@ -75,6 +103,7 @@ pub async fn run_agent_ssh_server(shutdown: CancellationToken) {
                         let config_clone = config.clone();
 
                         tokio::spawn(async move {
+                            let _permit = permit; // 持有 permit 直到会话结束
                             if let Err(e) = russh::server::run_stream(config_clone, socket, handler).await {
                                 tracing::error!("[Agent-SSH] 会话执行错误 (来自 {}): {}", peer_addr, e);
                             }
@@ -108,6 +137,8 @@ fn load_authorized_keys(path: &str) -> Result<Vec<ssh_key::PublicKey>> {
         }
         if let Ok(key) = ssh_key::PublicKey::from_openssh(line) {
             keys.push(key);
+        } else {
+            tracing::warn!("[Agent-SSH] 跳过无效 authorized_keys 行: {:?}", line);
         }
     }
     tracing::info!("[Agent-SSH] 加载 {} 个 authorized_keys", keys.len());
@@ -290,11 +321,27 @@ impl server::Handler for AgentSshSession {
         });
 
         // Async 任务: PTY 数据 → SSH channel → Console Proxy
+        // 含空闲超时保护
+        let idle_secs: u64 = std::env::var("SSH_IDLE_TIMEOUT")
+            .unwrap_or_else(|_| "3600".to_string())
+            .parse()
+            .unwrap_or(3600);
+
         tokio::spawn(async move {
-            while let Some(data) = pty_rx.recv().await {
-                if let Err(e) = server_handle.data(channel_id, data).await {
-                    tracing::warn!("[Agent-SSH] 发送数据到 SSH client 失败: {:?}", e);
-                    break;
+            let idle = std::time::Duration::from_secs(idle_secs);
+            loop {
+                match tokio::time::timeout(idle, pty_rx.recv()).await {
+                    Ok(Some(data)) => {
+                        if let Err(e) = server_handle.data(channel_id, data).await {
+                            tracing::warn!("[Agent-SSH] 发送数据到 SSH client 失败: {:?}", e);
+                            break;
+                        }
+                    }
+                    Ok(None) => break, // channel 关闭
+                    Err(_) => {
+                        tracing::warn!("[Agent-SSH] PTY 空闲超时 ({}s)，关闭会话 channel {:?}", idle_secs, channel_id);
+                        break;
+                    }
                 }
             }
             // bash 退出后关闭 channel

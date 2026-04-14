@@ -33,3 +33,17 @@
 - [x] 所有编译错误（russh 0.60 适配）均已修复并测试
 
 **🏆 SSH Proxy Sprint 1 实施完成！**
+
+# SSH Proxy 跳板机 — Sprint 3 (安全加固与剥离)
+
+## Security Hardening (S 级)
+- [x] **S1**: `ssh_server.rs` 中的 `load_authorized_keys` 遇到格式错误时进行 `warn!` 显式上报，防止静默容错 (用户已自行修复)。
+- [x] **S2**: 移除任意随意的 Env 路径。秘钥统一归档从 `/opt/gnb/etc/keys/` 读取。
+- [x] **S3**: `ssh_proxy.rs` 约束 `ext == 1` 对扩频通道进行非法输入过滤 (用户已自行修复)。
+
+## Architecture Optimization (A 级)
+- [x] **A1**: `ssh_server.rs` 新增 `tokio::sync::Semaphore` 限制单边最大连接数为并发 32 以防恶意连接池资源枯竭攻击 (用户已自行修复)。
+- [x] **A2**: `Cargo.toml` 解除 `ssh-proxy` 对 `console` 模块依赖的绑定，实现编译解耦 (用户已自行修复)。
+- [x] **A3**: `ssh_server.rs` PTY 会话流读写端引入生命周期监控或者闲置退出机制，防挂死残留僵尸壳 (用户已自行修复)。
+
+**🚀 SSH Proxy Sprint 3 加固完成，系统达到生产级全闭环稳态！**

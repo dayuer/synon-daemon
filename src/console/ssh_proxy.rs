@@ -22,7 +22,7 @@ use crate::console::ssh_db;
 pub async fn run_ssh_server(pool: Pool, shutdown: CancellationToken) {
     // 加载 Console host key
     let host_key_path = std::env::var("SSH_HOST_KEY")
-        .unwrap_or_else(|_| "ssh_keys/console_host_key".to_string());
+        .unwrap_or_else(|_| "/opt/gnb/etc/keys/console_host_key".to_string());
 
     let host_key = match load_host_key(&host_key_path) {
         Ok(k) => k,
@@ -367,7 +367,7 @@ impl server::Handler for SshProxySession {
 
         // 加载 Console client key
         let client_key_path = std::env::var("SSH_CLIENT_KEY")
-            .unwrap_or_else(|_| "ssh_keys/console_client_key".to_string());
+            .unwrap_or_else(|_| "/opt/gnb/etc/keys/console_client_key".to_string());
         let client_key = load_host_key(&client_key_path)?;
 
         // 建立 SSH Client 连接到 Agent
@@ -422,11 +422,14 @@ impl server::Handler for SshProxySession {
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext }) => {
-                        let _ = server_handle.extended_data(
-                            operator_channel_id,
-                            ext,
-                            data.to_vec(),
-                        ).await;
+                        // 仅转发 stderr (ext=1)，忽略其他扩展数据类型
+                        if ext == 1 {
+                            let _ = server_handle.extended_data(
+                                operator_channel_id,
+                                ext,
+                                data.to_vec(),
+                            ).await;
+                        }
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
                         tracing::info!("[SSH-Proxy] Agent channel 关闭");
