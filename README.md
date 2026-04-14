@@ -7,10 +7,11 @@
 ## 核心架构特性
 
 - **Ed25519 签名零信任认证**: 完全移除传统的明文 Token 依赖。Agent 节点在发送 MQTT 数据包时自动应用基于主控面板生成的非对称秘钥对进行时间戳 + Signature 签名，避免中间人或重放攻击。
+- **内置原生 SSH 跳板机 (Bastion Proxy)**: Console 侧集成高速并发 `russh` 代理，支持运维人员通过公钥白名单直连内网隧道；Agent 侧则自启硬核防护的真正级联 PTY `/bin/bash` 挂载引擎，全程零暴露端点面，实现最高级企业级操作内网穿透与按键拦截审查。
 - **十万级并发的 MQTT TCP 协议**: 从原有的 WebSocket (WSS) 演进到了严酷网络长连接更稳定的 MQTT 机制。利用 `rumqttc` 在终端机建立健壮的 QoS 1 保活（心跳 30s）。
 - **双工作模式切换**:
-  - `synon-daemon console`: Console 模式，需要带 `--features console` 编译。内置本地 broker 与 SQLite 管理。
-  - `synon-daemon agent`: 或直接运行无参名二进制，Agent 模式。
+  - `synon-daemon console`: Console 模式，需要带 `--features console` 或 `--features ssh-proxy` 编译。内置本地 broker 与 SQLite 管理。
+  - `synon-daemon agent`: 或直接运行无参名二进制，Agent 模式（配合 `--features ssh-proxy` 激活 SSH 功能）。
 - **并发任务串行排队与防重入**: 控制台下发的任务指令具备全局锁，借助通道 MPSC 模型确保耗时任务的局域单点安全性。
 - **降权隔离防护模型**: （可选）所有 AI 调用及高危 Shell 代码过滤，被置于系统低权限 `synon` 用户层下运行。
 
@@ -29,6 +30,11 @@ cargo build --release
 cargo build --release --features console
 ```
 
+**3. 编译支持跨网物理隧道的全血版本 (内置双侧的 PTY SSH Server / Client 桥接引擎)**
+```bash
+cargo build --release --features ssh-proxy
+```
+
 ## 目录索引指南
 
 - `src/main.rs`: 守护进程双模启动入口及系统看门狗（Watchdog）配置。
@@ -40,3 +46,10 @@ cargo build --release --features console
 - `src/skills_manager.rs`: Agent 侧自动化处理从 GitHub/源站获取并管理 AI 分析脚本的中心。
 - `src/self_updater.rs`: 面向节点自身的二进制热派发重载（OTA 更新验证）。
 - `src/claw_manager.rs` / `src/gnb_controller.rs`: 进程管控组件代理封装。
+
+### 系统集成组件 (Sprint 重点拓展)
+
+- `src/console/ssh_proxy.rs`: 运维直连网关代理引擎 (Console 端 SSH Server + 自动寻址内网)。
+- `src/ssh_server.rs`: Agent 专属 `portable-pty` 环境进程守护者及物理 Bash 管道桥接端。
+- `src/console/ssh_db.rs`: SQLite 运维公钥管理及全量会话审查日志引擎。
+- `scripts/gen_ssh_keys.sh`: CI/CD 流程中生成双向多阶段隔离架构 Ed25519 秘钥对的部署脚本。
