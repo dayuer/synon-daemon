@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use russh::{
     server,
+    server::Server,
     Channel, ChannelId,
 };
 use russh::keys::ssh_key;
@@ -33,6 +34,17 @@ pub async fn run_ssh_server(pool: Pool, shutdown: CancellationToken) {
         }
     };
 
+    // 预加载 Console client key（每个会话复用，避免重复磁盘 I/O）
+    let client_key_path = std::env::var("SSH_CLIENT_KEY")
+        .unwrap_or_else(|_| "/opt/gnb/etc/keys/console_client_key".to_string());
+    let client_key = match load_host_key(&client_key_path) {
+        Ok(k) => Arc::new(k),
+        Err(e) => {
+            tracing::error!("[SSH-Proxy] 加载 client key 失败 ({}): {}", client_key_path, e);
+            return;
+        }
+    };
+
     let bind_addr = std::env::var("SSH_PROXY_BIND")
         .unwrap_or_else(|_| "0.0.0.0".to_string());
     let bind_port: u16 = std::env::var("SSH_PROXY_PORT")
@@ -53,21 +65,36 @@ pub async fn run_ssh_server(pool: Pool, shutdown: CancellationToken) {
         }
     };
 
-    tracing::info!("[SSH-Proxy] Console SSH Server 启动，监听 {}:{}", bind_addr, bind_port);
+    // 连接数信号量
+    let max_conns: usize = std::env::var("SSH_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "32".to_string())
+        .parse()
+        .unwrap_or(32);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
+
+    tracing::info!("[SSH-Proxy] Console SSH Server 启动，监听 {}:{} (max_conn={})", bind_addr, bind_port, max_conns);
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!("[SSH-Proxy] 拒绝连接 (已达上限 {}): {}", max_conns, peer_addr);
+                                continue;
+                            }
+                        };
                         let mut server = SshProxyServer {
                             pool: pool.clone(),
+                            client_key: client_key.clone(),
                         };
-                        use russh::server::Server;
                         let handler = server.new_client(Some(peer_addr));
                         let config_clone = config.clone();
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = russh::server::run_stream(config_clone, socket, handler).await {
                                 tracing::error!("[SSH-Proxy] 会话执行错误 (来自 {}): {}", peer_addr, e);
                             }
@@ -150,6 +177,8 @@ async fn lookup_agent_addr(pool: &Pool, node_id: &str) -> Result<String> {
 /// Console SSH Proxy Server state
 struct SshProxyServer {
     pool: Pool,
+    /// 预加载的 Console client key（连接 Agent 时复用）
+    client_key: Arc<russh::keys::PrivateKey>,
 }
 
 impl server::Server for SshProxyServer {
@@ -162,10 +191,12 @@ impl server::Server for SshProxyServer {
         tracing::info!("[SSH-Proxy] 新连接来自 {}", peer);
         SshProxySession {
             pool: self.pool.clone(),
+            client_key: self.client_key.clone(),
             peer_addr: peer,
             authenticated: false,
             operator: None,
             username: None,
+            node_id: None,
             session_id: uuid::Uuid::new_v4().to_string(),
             server_handle: None,
             channel_id: None,
@@ -184,15 +215,17 @@ struct PtySizeParams {
     row: u32,
 }
 
-
-
 /// 单个 SSH 会话的 Handler
 struct SshProxySession {
     pool: Pool,
+    /// 预加载的 Console client key
+    client_key: Arc<russh::keys::PrivateKey>,
     peer_addr: String,
     authenticated: bool,
     operator: Option<String>,
     username: Option<String>,
+    /// 解析后的目标 nodeId（channel_open_session 时填充）
+    node_id: Option<String>,
     session_id: String,
     /// 向运维人员写回数据的 handle
     server_handle: Option<server::Handle>,
@@ -299,6 +332,9 @@ impl server::Handler for SshProxySession {
 
         tracing::info!("[SSH-Proxy] 打开 session → nodeId={}", node_id);
 
+        // 缓存 node_id 供后续 shell_request 使用
+        self.node_id = Some(node_id.clone());
+
         // 创建会话审计记录
         let pool = self.pool.clone();
         let sid = self.session_id.clone();
@@ -338,13 +374,9 @@ impl server::Handler for SshProxySession {
         _channel: ChannelId,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        let username = match &self.username {
-            Some(u) => u.clone(),
-            None => return Err(anyhow::anyhow!("无用户名")),
-        };
-        let node_id = match parse_node_id(&username) {
-            Some(id) => id.to_string(),
-            None => return Err(anyhow::anyhow!("无法解析 nodeId")),
+        let node_id = match &self.node_id {
+            Some(id) => id.clone(),
+            None => return Err(anyhow::anyhow!("无 nodeId")),
         };
 
         let server_handle = match self.server_handle.clone() {
@@ -365,10 +397,8 @@ impl server::Handler for SshProxySession {
         let agent_addr = lookup_agent_addr(&self.pool, &node_id).await?;
         tracing::info!("[SSH-Proxy] 连接 Agent {}", agent_addr);
 
-        // 加载 Console client key
-        let client_key_path = std::env::var("SSH_CLIENT_KEY")
-            .unwrap_or_else(|_| "/opt/gnb/etc/keys/console_client_key".to_string());
-        let client_key = load_host_key(&client_key_path)?;
+        // 使用预加载的 client key
+        let key_with_hash = russh::keys::PrivateKeyWithHashAlg::new(self.client_key.clone(), None);
 
         // 建立 SSH Client 连接到 Agent
         let config = Arc::new(client::Config {
@@ -378,8 +408,7 @@ impl server::Handler for SshProxySession {
         let mut agent_session = client::connect(config, &agent_addr, AgentClient).await
             .map_err(|e| anyhow::anyhow!("连接 Agent {} 失败: {}", agent_addr, e))?;
 
-        // 公钥认证 — russh 0.60 使用 PrivateKeyWithHashAlg
-        let key_with_hash = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(client_key), None);
+        // 公钥认证 — 使用预加载的 client key
         let auth_result = agent_session
             .authenticate_publickey("synon-console", key_with_hash)
             .await
@@ -462,7 +491,9 @@ impl server::Handler for SshProxySession {
     ) -> Result<(), Self::Error> {
         // 转发运维人员输入到 Agent
         if let (Some(ref agent_handle), Some(agent_ch)) = (&self.agent_writer, self.agent_channel_id) {
-            let _ = agent_handle.data(agent_ch, data.to_vec()).await;
+            if let Err(e) = agent_handle.data(agent_ch, data.to_vec()).await {
+                tracing::warn!("[SSH-Proxy] 转发输入到 Agent 失败: {:?}", e);
+            }
         }
         Ok(())
     }
@@ -473,17 +504,8 @@ impl server::Handler for SshProxySession {
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         tracing::info!("[SSH-Proxy] Channel EOF: session={}", self.session_id);
-
-        // 关闭 Agent 连接
+        // 关闭 Agent 连接 — bridge 任务会检测到并执行 close_session
         self.agent_writer = None;
-
-        let pool = self.pool.clone();
-        let sid = self.session_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ssh_db::close_session(&pool, &sid, "closed").await {
-                tracing::warn!("[SSH-Proxy] 关闭会话记录失败: {}", e);
-            }
-        });
         Ok(())
     }
 }

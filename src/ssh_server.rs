@@ -9,6 +9,7 @@ use std::sync::Mutex as StdMutex;
 use tokio_util::sync::CancellationToken;
 use russh::{
     server,
+    server::Server,
     Channel, ChannelId,
 };
 use russh::keys::ssh_key;
@@ -98,7 +99,6 @@ pub async fn run_agent_ssh_server(shutdown: CancellationToken) {
                         let mut server = AgentSshServer {
                             authorized_keys: Arc::new(authorized_keys.clone()),
                         };
-                        use russh::server::Server;
                         let handler = server.new_client(Some(peer_addr));
                         let config_clone = config.clone();
 
@@ -165,6 +165,7 @@ impl server::Server for AgentSshServer {
             server_handle: None,
             channel_id: None,
             pty_writer: None,
+            pty_master: None,
         }
     }
 }
@@ -183,6 +184,8 @@ struct AgentSshSession {
     server_handle: Option<server::Handle>,
     channel_id: Option<ChannelId>,
     pty_writer: Option<Arc<StdMutex<Box<dyn std::io::Write + Send>>>>,
+    /// PTY master handle — 保留用于 window resize
+    pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
 }
 
 impl server::Handler for AgentSshSession {
@@ -297,6 +300,9 @@ impl server::Handler for AgentSshSession {
         // 存储 writer 供 data() 回调使用
         self.pty_writer = Some(Arc::new(StdMutex::new(writer)));
 
+        // 保留 master PTY 供 window resize 使用
+        self.pty_master = Some(pair.master);
+
         // PTY stdout → SSH client 桥接
         // 使用 mpsc 解耦 blocking read 和 async write
         let (pty_tx, mut pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
@@ -379,8 +385,18 @@ impl server::Handler for AgentSshSession {
         _pix_height: u32,
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        // Sprint 2: 仅记录日志，不实现实时 resize
-        tracing::debug!("[Agent-SSH] 窗口大小变更请求: {}x{} (暂不转发到 PTY)", col, row);
+        if let Some(ref master) = self.pty_master {
+            if let Err(e) = master.resize(portable_pty::PtySize {
+                rows: row as u16,
+                cols: col as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                tracing::warn!("[Agent-SSH] PTY resize 失败: {}", e);
+            } else {
+                tracing::debug!("[Agent-SSH] PTY resize 成功: {}x{}", col, row);
+            }
+        }
         Ok(())
     }
 

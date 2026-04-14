@@ -215,7 +215,7 @@ impl ClawProxy {
 
         ClawStatus {
             running,
-            version: Self::read_version().await,
+            version: crate::claw_manager::read_local_version().await,
             uptime_ms: None,
         }
     }
@@ -307,12 +307,5 @@ impl ClawProxy {
                 Ok(resp.json().await.unwrap_or(Value::Null))
             }
         }
-    }
-
-    async fn read_version() -> Option<String> {
-        let output = tokio::process::Command::new("openclaw").arg("--version").output().await.ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        // "OpenClaw 2026.3.13 ..." → "2026.3.13"
-        text.split_whitespace().nth(1).map(|s| s.to_string())
     }
 }

@@ -51,3 +51,9 @@
 - **Task 5**: 在 `main.rs` 与 `console/mod.rs` 增加了 feature-gated 的 SSH 模块启动入口。
 - **Task 6**: 编写并执行了 `gen_ssh_keys.sh` 生成 Console 与 Agent 独立认证互信体系的所需的所有 ED25519 密钥对，并将密钥存放目录加入了 `.gitignore`。
 - **阻碍与解决**: 遇到重大的 `russh` API 断崖式更新（0.50->0.60），通过阅读源码编译错误、废弃 async_trait 宏，最终实现 0 warning 完美编译通过。
+
+## 2026-04-14 SSH Proxy Sprint 3 实施记录
+
+- **执行结果**: 成功执行 `git commit` 将代码库提交，完成了安全加固与架构重构的定版入库。
+- **高阶摘要**: 完成安全加固（显式捕获解析错误、统一密钥归档目录 `/opt/gnb/etc/keys/`、加固 PTY 通道输入过滤）和架构演进（限制最大并发并发数、解耦 `ssh-proxy` Feature 依赖、打通远端 PTY resize 指令流），并统一了全工程的 Timestamp MS 获取函数。
+- **遇到的阻碍**: 无严重阻碍，主要是重构了 `base64` 原创轮子到标准 crates，并按资深开发者标准平滑去除了多个废弃 import。

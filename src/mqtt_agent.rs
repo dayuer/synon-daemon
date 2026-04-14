@@ -448,39 +448,12 @@ async fn handle_deploy_file(path_str: &str, content_b64: &str) -> Result<()> {
     Ok(())
 }
 
-/// base64 解码（标准字母表，padding 可选）
+/// base64 解码（委托 base64 crate）
 fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    let input = input.trim();
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut table = [255u8; 256];
-    for (i, &c) in alphabet.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-    let input: Vec<u8> = input.bytes().filter(|&b| b != b'=').collect();
-    let mut i = 0;
-    while i < input.len() {
-        let rem = input.len() - i;
-        let a = table[input[i] as usize];
-        if a == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
-        if rem >= 2 {
-            let b = table[input[i+1] as usize];
-            if b == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
-            out.push((a << 2) | (b >> 4));
-            if rem >= 3 {
-                let c = table[input[i+2] as usize];
-                if c == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
-                out.push((b << 4) | (c >> 2));
-                if rem >= 4 {
-                    let d = table[input[i+3] as usize];
-                    if d == 255 { return Err(anyhow::anyhow!("base64 字符无效")); }
-                    out.push((c << 6) | d);
-                    i += 4;
-                } else { i += 3; }
-            } else { i += 2; }
-        } else { i += 1; }
-    }
-    Ok(out)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input.trim())
+        .map_err(|e| anyhow::anyhow!("base64 解码失败: {}", e))
 }
 
 /// 发布任务结果到 MQTT

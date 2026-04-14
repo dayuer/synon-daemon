@@ -80,10 +80,7 @@ async fn check_service(
     // 尝试通过 systemctl 重启（分离命令，避免阻塞）
     let restarted = restart_via_systemctl(name).await;
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let ts = crate::util::ts_ms();
 
     let alert = WatchdogAlert {
         node_id: node_id.to_string(),

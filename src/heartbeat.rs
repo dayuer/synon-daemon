@@ -11,7 +11,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 use tracing::debug;
 
@@ -81,10 +80,7 @@ pub fn init(gnb_map_path: String, claw_port: u16) {
 
 /// 采集一次完整系统状态
 pub async fn collect() -> Result<SysInfo> {
-    let ts = {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        now.as_secs() * 1000 + now.subsec_millis() as u64
-    };
+    let ts = crate::util::ts_ms();
 
     // 并行采集各模块（CPU 需要 100ms 间隔，其余同步）
     let cpu_percent = read_cpu_percent().await;

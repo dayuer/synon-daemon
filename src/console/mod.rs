@@ -17,10 +17,11 @@ pub mod session;
 pub mod heartbeat;
 pub mod task_queue;
 pub mod mqtt_broker;
+#[allow(dead_code)]
 pub mod auth;
-#[cfg(feature = "ssh-proxy")]
+#[cfg(all(feature = "ssh-proxy", feature = "console"))]
 pub mod ssh_db;
-#[cfg(feature = "ssh-proxy")]
+#[cfg(all(feature = "ssh-proxy", feature = "console"))]
 pub mod ssh_proxy;
 
 #[derive(Clone)]
@@ -71,7 +72,7 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
     });
 
     // ── SSH Proxy Server (feature-gated) ──
-    #[cfg(feature = "ssh-proxy")]
+    #[cfg(all(feature = "ssh-proxy", feature = "console"))]
     {
         // 初始化 SSH 数据库表
         let ssh_pool = pool.clone();

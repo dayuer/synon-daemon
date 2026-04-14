@@ -1,5 +1,8 @@
 //! auth.rs — Console MQTT 连接认证器 (Ed25519 签名验证)
 //!
+//! 注意: 此模块已完整实现但尚未被 mqtt_broker 集成调用，
+//! 暂时通过 allow(dead_code) 抑制编译警告。
+//!
 //! 验证流程：
 //!   1. MQTT CONNECT 的 username = nodeId, password = "timestamp:ed25519_sig_base64"
 //!   2. 检查 timestamp 不超过 5 分钟（防止重放攻击）
