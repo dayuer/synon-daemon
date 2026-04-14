@@ -1,55 +1,64 @@
 # Synon-Daemon
 
-**Synon-Daemon** 是 SynonClaw 中台架构下的**核心纯 Rust 守护进程**（极低资源占用，跨平台静态编译）。经过底层通信架构重构，该服务目前运行模式分为**双端形态**：
-1. **Agent 面（边缘工作节点）**：接收并执行远端命令、高频上报状态采集信息、进程看门狗（Watchdog），并管理 AI 技能的分配与调用。
-2. **Console 面（中控台直连核心）**：运行在主控服务器上，内置了高吞吐量的 `rumqttd` 代理，串联控制平台与全网成百上千个 Agent 工作负载，并将数据持久化到 SQLite (`nodes.db`) 中，桥接给前端的 Next.js 服务。
+**Synon-Daemon** 是 SynonClaw 中台架构下极低资源占用、跨平台的高性能纯 Rust 守护进程。它是驱动网络边缘计算与中心集成的端点。
+
+本守护进程分为两种运行态，依靠启动参数及特征门控器（Feature Flags）切换：
+
+1. **Agent 模式（边缘节点）**：常驻执行环境，高频抓取上报遥测数据，调度 AI 本地核心任务执行，以及建立反向内网穿透加密隧道。
+2. **Console 模式（中控模式）**：中心级 API 枢纽，挂载高吞吐并发控制网关、全局心跳监测与资产日志数据库化组件。
+
+---
 
 ## 核心架构特性
 
-- **Ed25519 签名零信任认证**: 完全移除传统的明文 Token 依赖。Agent 节点在发送 MQTT 数据包时自动应用基于主控面板生成的非对称秘钥对进行时间戳 + Signature 签名，避免中间人或重放攻击。
-- **内置原生 SSH 跳板机 (Bastion Proxy)**: Console 侧集成高速并发 `russh` 代理，支持运维人员通过公钥白名单直连内网隧道；Agent 侧则自启硬核防护的真正级联 PTY `/bin/bash` 挂载引擎，全程零暴露端点面，实现最高级企业级操作内网穿透与按键拦截审查。
-- **十万级并发的 MQTT TCP 协议**: 从原有的 WebSocket (WSS) 演进到了严酷网络长连接更稳定的 MQTT 机制。利用 `rumqttc` 在终端机建立健壮的 QoS 1 保活（心跳 30s）。
-- **双工作模式切换**:
-  - `synon-daemon console`: Console 模式，需要带 `--features console` 或 `--features ssh-proxy` 编译。内置本地 broker 与 SQLite 管理。
-  - `synon-daemon agent`: 或直接运行无参名二进制，Agent 模式（配合 `--features ssh-proxy` 激活 SSH 功能）。
-- **并发任务串行排队与防重入**: 控制台下发的任务指令具备全局锁，借助通道 MPSC 模型确保耗时任务的局域单点安全性。
-- **降权隔离防护模型**: （可选）所有 AI 调用及高危 Shell 代码过滤，被置于系统低权限 `synon` 用户层下运行。
+### 1. 面向广域网的安全网络底座
+- **MQTT 底层通信栈**: 将海量指令发布和上行状态同步构建于长连接的 MQTT TCP 协议之上，辅以 QoS 1 与终端自愈重连机制，轻松横担十万级并发心跳连接。
+- **Ed25519 零信任机制**: 彻底移除明文对称令牌。端点每一条数据全部通过预分配的 Ed25519 物理公私秘钥链实现签名和防重放攻击验证。
 
-## 环境与构建
+### 2. 企业级混合内网穿透能力 (Bastion Proxy)
+- **原生 SSH 隧道跳板**: Console 侧内置支持公钥指纹验证（查询隔离白名单拦截）的并发代理服务器。
+- **Agent 本地 PTY 派生**: 目标 Agent 在接到合法访问后能实时 Fork 本置于 Linux 环境伪终端（`/bin/bash`），双侧直接达成物理字符流透传级联，同时具备全量会话审查可溯源能力。
 
-随主控台 `scripts/initnode.sh` 或全链路构建体系联合部署打包。
+### 3. 可靠的隔离锁作业系统
+- **严格排队单态锁**: 下发至 Agent 的非幂等长距指令将统一进入 MPSC 通道完成调度排队，并防止重复冲突。
+- **降权隔离防护层**: 根据配置降级 `synon` 组用户运行命令，过滤任意风险提权函数漏洞。
+- **自我 OTA 维系**: 内置了基于数字签名对齐的二进制守护看门狗更新自洽协议（Self-Updater）。
 
-### 本地编译
-**1. 编译终端 Agent (纯净版, 裁剪了中控服务体积以分发)**
-```bash
-cargo build --release
-```
+---
 
-**2. 编译跳板中控台版 (包含全量 SQLite Driver 与 rumqttd)**
-```bash
-cargo build --release --features console
-```
+## 编译与工作模式
 
-**3. 编译支持跨网物理隧道的全血版本 (内置双侧的 PTY SSH Server / Client 桥接引擎)**
-```bash
-cargo build --release --features ssh-proxy
-```
+代码库可按需裁剪编译特性，降低不必要的依赖体积：
 
-## 目录索引指南
+1. **基础 Agent 版 (推荐部署态)**
+   此版本去除了控制台代码库，拥有极致体积。
+   ```bash
+   cargo build --release
+   ```
 
-- `src/main.rs`: 守护进程双模启动入口及系统看门狗（Watchdog）配置。
-- `src/mqtt_agent.rs`: **[核心]** Agent 侧 MQTT 客户端的链路状态机、订阅事件树、Pub/Sub 及网络断供重连层。
-- `src/console/`: **[核心]** Console 中控台侧内置的 `mqtt_broker`, `auth` (Ed25519校验) 以及 `nodes.db` 实体状态更新器等。
-- `src/config.rs`: 统一读取 `agent.conf` 参数环境。
-- `src/heartbeat.rs`: Agent 各项硬件、网络探测的高频采集器。
-- `src/exec_handler.rs` / `src/task_executor.rs`: 安全命令白名单与局域单并发串行命令调度锁框架。
-- `src/skills_manager.rs`: Agent 侧自动化处理从 GitHub/源站获取并管理 AI 分析脚本的中心。
-- `src/self_updater.rs`: 面向节点自身的二进制热派发重载（OTA 更新验证）。
-- `src/claw_manager.rs` / `src/gnb_controller.rs`: 进程管控组件代理封装。
+2. **控制节点版 (内置嵌入式 Broker + Node SQLite)**
+   ```bash
+   cargo build --release --features console
+   ```
 
-### 系统集成组件 (Sprint 重点拓展)
+3. **全血跳板机版 (附带 SSH PTY 映射透传网络代理编排)**
+   包含原生端对端通信环境。
+   ```bash
+   cargo build --release --features ssh-proxy
+   ```
 
-- `src/console/ssh_proxy.rs`: 运维直连网关代理引擎 (Console 端 SSH Server + 自动寻址内网)。
-- `src/ssh_server.rs`: Agent 专属 `portable-pty` 环境进程守护者及物理 Bash 管道桥接端。
-- `src/console/ssh_db.rs`: SQLite 运维公钥管理及全量会话审查日志引擎。
-- `scripts/gen_ssh_keys.sh`: CI/CD 流程中生成双向多阶段隔离架构 Ed25519 秘钥对的部署脚本。
+---
+
+## 核心模块索引表
+
+| 模块 / 路径                     | 职责定义                                                              |
+| ------------------------------- | --------------------------------------------------------------------- |
+| **`src/main.rs`**               | 系统主入口、并发生命周期统筹与热重载信号触发。                       |
+| **`src/mqtt_agent.rs`**         | Agent 的物理长连接传输层（发布 / 订阅与状态机）。                      |
+| **`src/console/*`**             | 中控网关子组件集：包括 `mqtt_broker`（总线）、`auth`（非对称校验）等。 |
+| **`src/console/ssh_proxy.rs`**  | Console 端 SSH 内网路由与跳板拦截分配调度器。                         |
+| **`src/ssh_server.rs`**         | 面向 Agent 端的伪终端 (PTY) 生成器及跨网数据透传执行核心。               |
+| **`src/console/ssh_db.rs`**     | 负责公钥与 SSH Session 的双路验证入库与监控审计。                        |
+| **`src/exec_handler.rs`**       | Linux 下高危 Shell 进程拦截净化过滤沙箱隔离器。                         |
+| **`src/skills_manager.rs`**     | 自动化本地分析脚本同步下载与生命周期拉起引擎。                         |
+| **`src/gnb_controller.rs`**     | 专网隔离环境下的物理组网管理套件集成。                                 |
