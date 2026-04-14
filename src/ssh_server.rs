@@ -248,7 +248,7 @@ impl server::Handler for AgentSshSession {
 
         // 启动 bash
         let cmd = portable_pty::CommandBuilder::new("/bin/bash");
-        let _child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| anyhow::anyhow!("启动 bash 失败: {}", e))?;
@@ -285,7 +285,8 @@ impl server::Handler for AgentSshSession {
                     Err(_) => break,
                 }
             }
-            tracing::debug!("[Agent-SSH] PTY reader 任务退出");
+            tracing::debug!("[Agent-SSH] PTY reader 任务退出，正在回收子进程...");
+            let _ = child.wait();
         });
 
         // Async 任务: PTY 数据 → SSH channel → Console Proxy
@@ -313,8 +314,11 @@ impl server::Handler for AgentSshSession {
     ) -> Result<(), Self::Error> {
         // 将 Console Proxy 发来的键盘输入写入 PTY stdin
         if let Some(ref writer) = self.pty_writer {
-            let mut w = writer.lock().unwrap();
-            w.write_all(data)?;
+            if let Ok(mut w) = writer.lock() {
+                w.write_all(data)?;
+            } else {
+                tracing::error!("[Agent-SSH] PTY writer lock poisoned");
+            }
         }
         Ok(())
     }

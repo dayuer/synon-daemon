@@ -169,7 +169,7 @@ impl server::Server for SshProxyServer {
             session_id: uuid::Uuid::new_v4().to_string(),
             server_handle: None,
             channel_id: None,
-            pty_size: OptionField::None,
+            pty_size: None,
             agent_writer: None,
             agent_channel_id: None,
         }
@@ -184,11 +184,7 @@ struct PtySizeParams {
     row: u32,
 }
 
-/// 避免 Option<PtySizeParams> 与 None 冲突的包装
-enum OptionField<T> {
-    Some(T),
-    None,
-}
+
 
 /// 单个 SSH 会话的 Handler
 struct SshProxySession {
@@ -203,7 +199,7 @@ struct SshProxySession {
     /// 运维人员侧 channel id
     channel_id: Option<ChannelId>,
     /// PTY 尺寸（shell_request 前可能收到 pty_request）
-    pty_size: OptionField<PtySizeParams>,
+    pty_size: Option<PtySizeParams>,
     /// Agent SSH client handle（用于向 Agent 转发输入）
     agent_writer: Option<client::Handle<AgentClient>>,
     /// Agent 侧 channel id
@@ -235,11 +231,7 @@ impl server::Handler for SshProxySession {
 
         let pool = self.pool.clone();
         let fp_lookup = fp_str.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                ssh_db::lookup_operator_by_fingerprint(&pool, &fp_lookup)
-            )
-        });
+        let result = ssh_db::lookup_operator_by_fingerprint(&pool, &fp_lookup).await;
 
         match result {
             Ok(Some(name)) => {
@@ -333,7 +325,7 @@ impl server::Handler for SshProxySession {
         _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         tracing::info!("[SSH-Proxy] PTY 请求: term={} {}x{}", term, col, row);
-        self.pty_size = OptionField::Some(PtySizeParams {
+        self.pty_size = Some(PtySizeParams {
             term: term.to_string(),
             col,
             row,
@@ -365,13 +357,13 @@ impl server::Handler for SshProxySession {
         };
 
         let (cols, rows) = match &self.pty_size {
-            OptionField::Some(s) => (s.col, s.row),
-            OptionField::None => (80, 24),
+            Some(s) => (s.col, s.row),
+            None => (80, 24),
         };
 
         // 查询 Agent 地址
         let agent_addr = lookup_agent_addr(&self.pool, &node_id).await?;
-        tracing::info!("[SSH-Proxy] 连接 Agent {}:{}", agent_addr, 22222);
+        tracing::info!("[SSH-Proxy] 连接 Agent {}", agent_addr);
 
         // 加载 Console client key
         let client_key_path = std::env::var("SSH_CLIENT_KEY")
