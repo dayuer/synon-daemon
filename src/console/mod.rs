@@ -1,13 +1,13 @@
 use axum::{
     routing::get,
     Router,
-    extract::{ws::{WebSocket, WebSocketUpgrade}, State, Query},
+    extract::{ws::{WebSocket, WebSocketUpgrade}, State},
     response::IntoResponse,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-use serde::Deserialize;
+
 use futures_util::{StreamExt, SinkExt};
 use axum::extract::ws::Message;
 use rumqttd::local::LinkTx;
@@ -18,6 +18,10 @@ pub mod heartbeat;
 pub mod task_queue;
 pub mod mqtt_broker;
 pub mod auth;
+#[cfg(feature = "ssh-proxy")]
+pub mod ssh_db;
+#[cfg(feature = "ssh-proxy")]
+pub mod ssh_proxy;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +69,24 @@ pub async fn run_server(config_path: String, shutdown_token: CancellationToken) 
             link_tx, link_rx,
         ).await;
     });
+
+    // ── SSH Proxy Server (feature-gated) ──
+    #[cfg(feature = "ssh-proxy")]
+    {
+        // 初始化 SSH 数据库表
+        let ssh_pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ssh_db::init_tables(&ssh_pool).await {
+                tracing::error!("[SSH-Proxy] 初始化 SSH 数据库表失败: {}", e);
+            }
+        });
+
+        let ssh_pool2 = pool.clone();
+        let ssh_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            ssh_proxy::run_ssh_server(ssh_pool2, ssh_shutdown).await;
+        });
+    }
 
     // dispatcher_tx 共享给 state（Web UI 实时下发）和 task_queue（定时调度）
     let shared_dispatcher = Arc::new(Mutex::new(dispatcher_tx));
@@ -133,6 +155,10 @@ async fn handle_ui_socket(socket: WebSocket, state: AppState) {
     let session_id = state.session.add_ui(tx.clone()).await;
     tracing::info!("Web UI [{}] WebSocket 连接已建立", session_id);
 
+    // 认证状态 — dispatch 等敏感操作必须先通过 auth
+    let mut authenticated = false;
+    let api_token = std::env::var("CONSOLE_API_TOKEN").unwrap_or_default();
+
     // 写入线程
     let sid_for_tx = session_id.clone();
     tokio::spawn(async move {
@@ -172,18 +198,29 @@ async fn handle_ui_socket(socket: WebSocket, state: AppState) {
 
                             match msg_type {
                                 "ping" => {
-                                    // 应用层 ping → 回 pong
-                                    let pong = serde_json::json!({ "type": "pong", "ts": chrono_ts_ms() });
+                                    let pong = serde_json::json!({ "type": "pong", "ts": crate::util::ts_ms() });
                                     let _ = tx.send(Message::Text(pong.to_string()));
                                 }
                                 "auth" => {
-                                    // Bridge 认证消息 → 回 auth_ok
-                                    let ack = serde_json::json!({ "type": "auth_ok" });
-                                    let _ = tx.send(Message::Text(ack.to_string()));
+                                    // Token 认证：客户端需携带 {"type":"auth","token":"..."}
+                                    let client_token = json.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                                    if api_token.is_empty() || client_token == api_token {
+                                        authenticated = true;
+                                        let ack = serde_json::json!({ "type": "auth_ok" });
+                                        let _ = tx.send(Message::Text(ack.to_string()));
+                                    } else {
+                                        tracing::warn!("Web UI [{}] 认证失败: token 不匹配", session_id);
+                                        let err = serde_json::json!({ "type": "auth_failed", "error": "token 无效" });
+                                        let _ = tx.send(Message::Text(err.to_string()));
+                                    }
                                 }
                                 "dispatch" => {
-                                    // Web UI → Agent 实时指令下发
-                                    handle_web_dispatch(&json, &state, &tx).await;
+                                    if !authenticated {
+                                        let err = serde_json::json!({ "type": "dispatch_error", "error": "未认证，请先发送 auth 消息" });
+                                        let _ = tx.send(Message::Text(err.to_string()));
+                                    } else {
+                                        handle_web_dispatch(&json, &state, &tx).await;
+                                    }
                                 }
                                 _ => {
                                     tracing::debug!("Web UI {} 发送: {}", session_id, msg_type);
@@ -272,10 +309,4 @@ async fn handle_web_dispatch(
     }
 }
 
-    // 获取当前毫秒时间戳
-fn chrono_ts_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+// 时间戳函数已统一至 crate::util::ts_ms()

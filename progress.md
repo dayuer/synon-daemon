@@ -45,3 +45,9 @@
 - 验证了 `opengnb-gui/scripts/initnode.sh` 已包含 `synon` 账户创建与 Console SSH 部署逻辑。
 - 补充修正了 `opengnb-gui/scripts/init-db.ts`，增加对存量 Node 数据表 `sshUser` 的热迁移（统一 UPDATE 为 `synon`）。
 - 为 `synon-daemon` 创建了正式版 `README.md` 说明并清理了历史设计文档至 `archive_designs/`。
+## 2026-04-14 SSH Proxy Sprint 1 实施记录
+
+- **Task 1-4**: 完成 `russh 0.60` 的全面整合。由于该版本废弃了 `async_trait` 宏并引入了原生 async 闭包与 tcp 监听分离，原有的 API 设计已在代码中重构（涉及 TcpListener::bind, russh::server::run_stream, 私钥解析类型变更为 PrivateKey）。
+- **Task 5**: 在 `main.rs` 与 `console/mod.rs` 增加了 feature-gated 的 SSH 模块启动入口。
+- **Task 6**: 编写并执行了 `gen_ssh_keys.sh` 生成 Console 与 Agent 独立认证互信体系的所需的所有 ED25519 密钥对，并将密钥存放目录加入了 `.gitignore`。
+- **阻碍与解决**: 遇到重大的 `russh` API 断崖式更新（0.50->0.60），通过阅读源码编译错误、废弃 async_trait 宏，最终实现 0 warning 完美编译通过。

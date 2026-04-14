@@ -18,8 +18,11 @@ mod self_updater;
 mod watchdog;
 mod task_executor;
 mod task_dedup;
+mod util;
 #[cfg(feature = "console")]
 mod console;
+#[cfg(feature = "ssh-proxy")]
+mod ssh_server;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -98,11 +101,11 @@ async fn main() {
 
     tracing::info!("synon-daemon v{} (build {}) 启动", env!("CARGO_PKG_VERSION"), env!("BUILD_VERSION"));
 
-    let exec_cmd = args.command.unwrap_or(Commands::Agent);
+    let _exec_cmd = args.command.unwrap_or(Commands::Agent);
 
     // 如果是 Console 模式，启动后端服务并直接等待关闭（Console模式不需要 agent.conf）
     #[cfg(feature = "console")]
-    if exec_cmd == Commands::Console {
+    if _exec_cmd == Commands::Console {
         tracing::info!(">>> 进入 Console Backend 模式 <<<");
         // 全局关闭令牌 — 所有子任务通过此 token 感知优雅关闭
         let shutdown = CancellationToken::new();
@@ -183,6 +186,15 @@ async fn main() {
     let h_sighup = tokio::spawn(async move {
         watch_sighup(config_path).await;
     });
+
+    // Agent SSH Server (feature-gated, 仅 ssh-proxy feature 启用时编译)
+    #[cfg(feature = "ssh-proxy")]
+    {
+        let ssh_token = shutdown.clone();
+        let _h_agent_ssh = tokio::spawn(async move {
+            ssh_server::run_agent_ssh_server(ssh_token).await;
+        });
+    }
 
     tracing::info!(">>> 使用 MQTT 通信层 <<<");
     let ws_token = shutdown.clone();

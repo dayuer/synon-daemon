@@ -2,13 +2,13 @@
 //!
 //! Console 下发的耗时命令（exec_cmd / skill_install 等）
 //! 通过 mpsc channel 入队，串行执行，防止任务风暴压垮节点。
-//! 结果通过 resp_tx 回写到 WS write loop。
+//! 结果通过 MQTT publish 回传给 Console。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::claw_manager;
 use crate::exec_handler;
