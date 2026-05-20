@@ -17,6 +17,7 @@ use crate::gnb_monitor;
 use crate::task_executor::{self, TaskMessage};
 use crate::task_dedup::TaskDedup;
 use crate::watchdog::WatchdogAlert;
+use crate::ai_bridge::AiBridge;
 
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, LastWill};
@@ -34,6 +35,7 @@ pub async fn run(
     config: DaemonConfig,
     mut alert_rx: mpsc::Receiver<WatchdogAlert>,
     shutdown: tokio_util::sync::CancellationToken,
+    ai_bridge: Arc<AiBridge>,
 ) {
     let node_id = &config.node_id;
     let client_id = format!("agent-{}", node_id);
@@ -125,6 +127,8 @@ pub async fn run(
     let beat_client = client.clone();
     let beat_config = config.clone();
     let beat_shutdown = shutdown.clone();
+    let beat_ai = ai_bridge.clone();
+    let beat_task_tx = task_tx.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         loop {
@@ -136,8 +140,49 @@ pub async fn run(
                 _ = ticker.tick() => {
                     // systemd watchdog 心跳
                     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
-                    match build_heartbeat(&beat_config).await {
-                        Ok(payload) => {
+                    match heartbeat::collect().await {
+                        Ok(sys_info) => {
+                            // 将遥测数据推送给 Python AI Agent（非阻塞，失败不影响心跳）
+                            let metrics = serde_json::to_value(&sys_info).unwrap_or_default();
+                            let decision = beat_ai.observe(&metrics).await;
+                            if decision.action != "keep_alive" {
+                                info!("[MqttAgent] AI 决策: {} (目标: {}, 原因: {}, 置信度: {})",
+                                    decision.action, decision.target, decision.reason, decision.confidence);
+                                
+                                // 生成自愈任务并发送到串行执行器中
+                                let req_id = json!(format!("ai-self-heal-{}", ts_ms()));
+                                let task_msg = match decision.action.as_str() {
+                                    "restart_service" => {
+                                        let service = if decision.target == "claw" {
+                                            "openclaw-gateway"
+                                        } else {
+                                            &decision.target
+                                        };
+                                        Some(TaskMessage::ExecCmd {
+                                            req_id,
+                                            command: format!("systemctl restart {}", service),
+                                            allowed_extra: vec![],
+                                        })
+                                    }
+                                    "emergency_cleanup" => {
+                                        Some(TaskMessage::ExecCmd {
+                                            req_id,
+                                            command: "journalctl --vacuum-time=1d".to_string(),
+                                            allowed_extra: vec![],
+                                        })
+                                    }
+                                    _ => None,
+                                };
+
+                                if let Some(task) = task_msg {
+                                    if let Err(e) = beat_task_tx.try_send(task) {
+                                        warn!("[MqttAgent] 派发 AI 自愈任务失败: {}", e);
+                                    }
+                                }
+                            }
+
+                            // 构建并发送 MQTT 心跳
+                            let payload = build_heartbeat_payload(sys_info, &beat_config);
                             let topic = format!("synon/agent/{}/heartbeat", beat_config.node_id);
                             if let Err(e) = beat_client.publish(
                                 topic, QoS::AtMostOnce, false, payload.into_bytes()
@@ -555,7 +600,24 @@ async fn run_task_executor(
     }
 }
 
-/// 构建心跳 JSON（复用 heartbeat::collect）
+/// 构建心跳 JSON payload（从已采集的 SysInfo 构造）
+fn build_heartbeat_payload(sys: heartbeat::SysInfo, config: &DaemonConfig) -> String {
+    let msg = json!({
+        "type": "heartbeat",
+        "nodeId": config.node_id,
+        "ts": sys.ts,
+        "sysInfo": sys,
+        "gnbStatus": sys.gnb_status,
+        "gnbAddresses": sys.gnb_addresses,
+        "clawRunning": sys.claw_running,
+        "clawRpcOk": sys.claw_rpc_ok,
+        "installedSkills": sys.installed_skills,
+    });
+    msg.to_string()
+}
+
+/// 构建心跳 JSON（兼容旧调用路径）
+#[allow(dead_code)]
 async fn build_heartbeat(config: &DaemonConfig) -> Result<String> {
     let sys = heartbeat::collect().await?;
     let gnb = gnb_monitor::collect(&config.gnb_map_path.to_string_lossy()).await.ok();

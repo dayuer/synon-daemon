@@ -19,6 +19,7 @@ mod watchdog;
 mod task_executor;
 mod task_dedup;
 mod util;
+mod ai_bridge;
 #[cfg(feature = "console")]
 mod console;
 #[cfg(feature = "ssh-proxy")]
@@ -147,6 +148,14 @@ async fn main() {
         watchdog::run(node_id, alert_tx, watchdog_token).await;
     });
 
+    // 启动 AI Bridge（Python 子进程 + UDS IPC）
+    let ai = std::sync::Arc::new(ai_bridge::AiBridge::new(&config.node_id));
+    let ai_token = shutdown.clone();
+    let ai_handle = ai.clone();
+    let h_ai = tokio::spawn(async move {
+        ai_bridge::run(ai_handle, ai_token).await;
+    });
+
     // 启动自动更新检查（24h 间隔，首次延迟 5min）
     let updater_token = shutdown.clone();
     let updater_config = config.clone();
@@ -198,8 +207,9 @@ async fn main() {
 
     tracing::info!(">>> 使用 MQTT 通信层 <<<");
     let ws_token = shutdown.clone();
+    let ai_agent = ai.clone();
     let h_ws = tokio::spawn(async move {
-        mqtt_agent::run(config, alert_rx, ws_token).await;
+        mqtt_agent::run(config, alert_rx, ws_token, ai_agent).await;
     });
 
     // 等待关闭信号
@@ -212,7 +222,7 @@ async fn main() {
     // 等待子任务退出（5s 超时后强制 abort）
     let grace = tokio::time::Duration::from_secs(5);
     let _ = tokio::time::timeout(grace, async {
-        let _ = tokio::join!(h_ws, h_watchdog, h_updater, h_skills);
+        let _ = tokio::join!(h_ws, h_watchdog, h_updater, h_skills, h_ai);
     }).await;
 
     h_sighup.abort(); // SIGHUP watcher 无需优雅退出

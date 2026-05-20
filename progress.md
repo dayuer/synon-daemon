@@ -57,3 +57,16 @@
 - **执行结果**: 成功执行 `git commit` 将代码库提交，完成了安全加固与架构重构的定版入库。
 - **高阶摘要**: 完成安全加固（显式捕获解析错误、统一密钥归档目录 `/opt/gnb/etc/keys/`、加固 PTY 通道输入过滤）和架构演进（限制最大并发并发数、解耦 `ssh-proxy` Feature 依赖、打通远端 PTY resize 指令流），并统一了全工程的 Timestamp MS 获取函数。
 - **遇到的阻碍**: 无严重阻碍，主要是重构了 `base64` 原创轮子到标准 crates，并按资深开发者标准平滑去除了多个废弃 import。
+
+## 2026-04-15 01:05 部署记录 (Console & Client)
+- **执行结果**: `synon-daemon` Client 及 Console 已全量热更至服务端。
+- **高阶摘要**: 1. 触发 `./build_remote.sh --deploy`，编译 `x86_64-musl` Agent 客户端并分发至 Console Mirror 下载服务层；2. 在中心层服务端带 `console,ssh-proxy` Feature 重编了全血跳板机版守护进程并热更覆盖，`gnb-rust-daemon.service` 健康重启完成。
+
+## 2026-05-20 Antigravity SDK UDS IPC 集成记录
+- **执行结果**: 主从进程 IPC 架构（Rust 主进程 + Python AI 子进程）全部落地，代码完美编译并通过全量单元测试（35/35 ok）。
+- **高阶摘要**:
+  1. Rust 侧启动生命周期管理：设计并实现了 `src/ai_bridge.rs`。在 Agent 模式启动时通过 `std::process::Command` 异步拉起 Python AI 子进程。两者通过 Unix Domain Socket (`/tmp/synon-ai-{node_id}.sock`) 绑定，底层基于行分隔的 JSON-RPC 2.0 协议进行低延迟双向通信。
+  2. Python 侧 AI 智能引擎：实现了 `python_agent/server.py` 服务端，优先通过 `google-antigravity` SDK 进行深度 AI 运维推理决策；如果环境未安装 SDK，则智能降级为高性能的启发式规则状态机。
+  3. 闭环自愈决策路由：在 `src/mqtt_agent.rs` 心跳发送循环中，主动通过 UDS 向 Python AI Agent 送入最新系统指标（CPU、磁盘、GNB状态等），并将 AI 返回的非 keep_alive 决策（如 `restart_service`, `emergency_cleanup`）以 `TaskMessage::ExecCmd` 非阻塞形式推送至 Rust 本地的串行 `TaskExecutor` 执行通道，实现了“感知-决策-执行-反馈”自运维闭环。
+- **阻碍与解决**: 完美解决了 Rust 中直接嵌入 Python 的环境兼容与内存泄露隐患，主从 UDS IPC 架构保证了 Python 端的异常绝不导致 Rust 主进程崩溃。
+

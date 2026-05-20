@@ -1,0 +1,3 @@
+# Synon AI Agent 依赖
+# SDK 为可选依赖 — 未安装时自动降级为规则引擎
+google-antigravity>=0.1.0
